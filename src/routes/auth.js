@@ -16,16 +16,23 @@ router.post('/login', async (req, res) => {
 
     const emailClean = email.trim().toLowerCase();
 
-    const { data: user, error } = await supabase
+    // Query separada: usuario primeiro, depois role
+    const { data: user, error: userErr } = await supabase
       .from('users')
-      .select('*, roles(name, permissions)')
+      .select('*')
       .eq('email', emailClean)
       .eq('status', 'active')
-      .single();
+      .maybeSingle();
 
-    if (error || !user || !bcrypt.compareSync(password, user.password_hash)) {
+    if (userErr || !user || !bcrypt.compareSync(password, user.password_hash)) {
       return res.status(401).json({ error: 'E-mail ou senha incorretos' });
     }
+
+    const { data: role } = await supabase
+      .from('roles')
+      .select('name, permissions')
+      .eq('id', user.role_id)
+      .maybeSingle();
 
     await supabase
       .from('users')
@@ -35,9 +42,8 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '12h' });
     const userData = { ...user };
     delete userData.password_hash;
-    userData.role_name = userData.roles?.name;
-    userData.permissions = JSON.parse(userData.roles?.permissions || '{}');
-    delete userData.roles;
+    userData.role_name = role?.name || '';
+    userData.permissions = JSON.parse(role?.permissions || '{}');
 
     res.json({ token, user: userData });
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
@@ -80,19 +86,17 @@ router.post('/change-password', authenticate, async (req, res) => {
 // Listar usuarios
 router.get('/users', authenticate, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data: users, error } = await supabase
       .from('users')
-      .select('id, name, email, status, last_login, created_at, roles(id, name)')
+      .select('id, name, email, status, last_login, created_at, role_id')
       .order('name');
 
     if (error) throw error;
-    const users = data.map(u => ({
-      ...u,
-      role_id: u.roles?.id,
-      role_name: u.roles?.name,
-      roles: undefined
-    }));
-    res.json(users);
+
+    const { data: roles } = await supabase.from('roles').select('id, name');
+    const roleMap = Object.fromEntries((roles || []).map(r => [r.id, r.name]));
+
+    res.json(users.map(u => ({ ...u, role_name: roleMap[u.role_id] || '' })));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
