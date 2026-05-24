@@ -2,7 +2,7 @@ const jwt = require('jsonwebtoken');
 const { supabase } = require('../../database/db');
 
 if (!process.env.JWT_SECRET) {
-  throw new Error('Missing required environment variable: JWT_SECRET must be set.');
+  throw new Error('FATAL: JWT_SECRET must be set.');
 }
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -15,19 +15,24 @@ async function authenticate(req, res, next) {
     const token = header.split(' ')[1];
     const decoded = jwt.verify(token, JWT_SECRET);
 
+    // Query separada: usuario depois role
     const { data: user, error } = await supabase
       .from('users')
-      .select('*, roles(name, permissions)')
+      .select('*')
       .eq('id', decoded.userId)
       .eq('status', 'active')
-      .single();
+      .maybeSingle();
 
     if (error || !user) return res.status(401).json({ error: 'Usuario invalido ou inativo' });
 
-    // Flatten role fields
-    user.role_name = user.roles?.name;
-    user.permissions = JSON.parse(user.roles?.permissions || '{}');
-    delete user.roles;
+    const { data: role } = await supabase
+      .from('roles')
+      .select('name, permissions')
+      .eq('id', user.role_id)
+      .maybeSingle();
+
+    user.role_name = role?.name || '';
+    user.permissions = JSON.parse(role?.permissions || '{}');
     delete user.password_hash;
     req.user = user;
     next();
