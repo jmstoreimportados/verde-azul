@@ -1,52 +1,98 @@
 const express = require('express');
-const { getDb } = require('../../database/db');
+const { supabase } = require('../../database/db');
 const { authenticate } = require('../middleware/auth');
 const router = express.Router();
 
+const isProd = process.env.NODE_ENV === 'production';
+const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
+
 router.get('/', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const employees = await db.prepare('SELECT * FROM employees ORDER BY name').all();
+    const { data, error } = await supabase
+      .from('employees')
+      .select('*')
+      .order('name');
+    if (error) throw error;
+
     const now = new Date();
-    const monthStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
-    for (const e of employees) {
-      const stats = await db.prepare(`SELECT COUNT(*) as completed, ROUND(AVG(rating)::numeric,1) as avg_rating FROM services WHERE employee_id = $1 AND status='completed' AND completed_date LIKE $2`).get(e.id, `${monthStr}-%`);
-      e.services_this_month = parseInt(stats.completed);
-      e.avg_rating = stats.avg_rating;
+    const monthStart = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`;
+    const monthEnd = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-31`;
+
+    for (const e of (data || [])) {
+      const { data: svcs } = await supabase
+        .from('services')
+        .select('rating')
+        .eq('employee_id', e.id)
+        .eq('status', 'completed')
+        .gte('completed_date', monthStart)
+        .lte('completed_date', monthEnd);
+
+      const ratings = (svcs || []).map(s => s.rating).filter(r => r !== null);
+      e.services_this_month = (svcs || []).length;
+      e.avg_rating = ratings.length > 0
+        ? parseFloat((ratings.reduce((a, b) => a + b, 0) / ratings.length).toFixed(1))
+        : null;
     }
-    res.json(employees);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 router.post('/', authenticate, async (req, res) => {
   try {
     const { name, phone, email, function: func, notes } = req.body;
     if (!name) return res.status(400).json({ error: 'Nome obrigatorio' });
-    const db = getDb();
-    const result = await db.prepare('INSERT INTO employees (name,phone,email,function,notes) VALUES ($1,$2,$3,$4,$5)').run(name, phone||null, email||null, func||null, notes||null);
-    res.json({ id: result.lastInsertRowid, message: 'Funcionario cadastrado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const { data, error } = await supabase
+      .from('employees')
+      .insert({ name, phone: phone || null, email: email || null, function: func || null, notes: notes || null })
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    res.json({ id: data.id, message: 'Funcionario cadastrado' });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 router.put('/:id', authenticate, async (req, res) => {
   try {
     const { name, phone, email, function: func, status, notes } = req.body;
-    const db = getDb();
-    await db.prepare('UPDATE employees SET name=$1,phone=$2,email=$3,function=$4,status=$5,notes=$6 WHERE id=$7').run(name, phone||null, email||null, func||null, status||'active', notes||null, req.params.id);
+    const { error } = await supabase
+      .from('employees')
+      .update({ name, phone: phone || null, email: email || null, function: func || null, status: status || 'active', notes: notes || null })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
     res.json({ message: 'Funcionario atualizado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 router.get('/:id/schedule', authenticate, async (req, res) => {
   try {
     const { month, year } = req.query;
-    const db = getDb();
-    let query = `SELECT s.*, c.name as client_name, c.address, c.neighborhood FROM services s JOIN clients c ON s.client_id = c.id WHERE s.employee_id = $1 AND s.status != 'cancelled'`;
-    const params = [req.params.id];
-    if (month && year) { query += ' AND s.scheduled_date LIKE $2'; params.push(`${year}-${String(month).padStart(2,'0')}-%`); }
-    query += ' ORDER BY s.scheduled_date';
-    res.json(await db.prepare(query).all(...params));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    let query = supabase
+      .from('services')
+      .select('*, clients(name, address, neighborhood)')
+      .eq('employee_id', req.params.id)
+      .neq('status', 'cancelled')
+      .order('scheduled_date');
+
+    if (month && year) {
+      query = query
+        .gte('scheduled_date', `${year}-${String(month).padStart(2,'0')}-01`)
+        .lte('scheduled_date', `${year}-${String(month).padStart(2,'0')}-31`);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    res.json((data || []).map(s => ({
+      ...s,
+      client_name: s.clients?.name,
+      address: s.clients?.address,
+      neighborhood: s.clients?.neighborhood,
+      clients: undefined
+    })));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 module.exports = router;

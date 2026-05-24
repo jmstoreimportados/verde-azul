@@ -255,3 +255,185 @@ INSERT INTO products (name, description, category, unit, cost_price, sale_price,
 ('Fertilizante NPK', 'Fertilizante para jardim', 'garden', 'kg', 5, 12, 15, 4),
 ('Inseticida', 'Controle de pragas', 'garden', 'L', 18, 35, 5, 2)
 ON CONFLICT DO NOTHING;
+
+-- =====================================================
+-- RPC FUNCTIONS FOR COMPLEX REPORTS
+-- Execute these in the Supabase SQL Editor after tables are created
+-- =====================================================
+
+-- Revenue by month (last 6 months)
+CREATE OR REPLACE FUNCTION get_revenue_by_month()
+RETURNS TABLE (
+  month TEXT,
+  year INT,
+  month_num INT,
+  received NUMERIC,
+  pending NUMERIC,
+  expenses NUMERIC,
+  profit NUMERIC
+)
+LANGUAGE sql STABLE AS $$
+  WITH months AS (
+    SELECT generate_series(0, 5) AS offset
+  ),
+  month_dates AS (
+    SELECT
+      date_trunc('month', NOW() - (offset || ' months')::interval) AS month_start
+    FROM months
+  ),
+  data AS (
+    SELECT
+      to_char(md.month_start, 'MM/YYYY') AS month,
+      EXTRACT(YEAR FROM md.month_start)::INT AS year,
+      EXTRACT(MONTH FROM md.month_start)::INT AS month_num,
+      COALESCE(SUM(CASE WHEN ch.status = 'paid' THEN ch.value ELSE 0 END), 0) AS received,
+      COALESCE(SUM(CASE WHEN ch.status IN ('pending','overdue') THEN ch.value ELSE 0 END), 0) AS pending,
+      0 AS expenses_placeholder
+    FROM month_dates md
+    LEFT JOIN charges ch ON ch.due_date >= to_char(md.month_start, 'YYYY-MM-01')
+                        AND ch.due_date <= to_char(md.month_start + INTERVAL '1 month' - INTERVAL '1 day', 'YYYY-MM-DD')
+    GROUP BY md.month_start
+  )
+  SELECT
+    d.month,
+    d.year,
+    d.month_num,
+    d.received,
+    d.pending,
+    COALESCE((
+      SELECT SUM(e.value) FROM expenses e
+      WHERE e.date >= to_char(date_trunc('month', make_date(d.year, d.month_num, 1)), 'YYYY-MM-01')
+        AND e.date <= to_char(date_trunc('month', make_date(d.year, d.month_num, 1)) + INTERVAL '1 month' - INTERVAL '1 day', 'YYYY-MM-DD')
+    ), 0) AS expenses,
+    d.received - COALESCE((
+      SELECT SUM(e.value) FROM expenses e
+      WHERE e.date >= to_char(date_trunc('month', make_date(d.year, d.month_num, 1)), 'YYYY-MM-01')
+        AND e.date <= to_char(date_trunc('month', make_date(d.year, d.month_num, 1)) + INTERVAL '1 month' - INTERVAL '1 day', 'YYYY-MM-DD')
+    ), 0) AS profit
+  FROM data d
+  ORDER BY d.year, d.month_num;
+$$;
+
+-- Overdue charges with days overdue
+CREATE OR REPLACE FUNCTION get_overdue_with_days()
+RETURNS TABLE (
+  id INT,
+  client_id INT,
+  description TEXT,
+  type TEXT,
+  value NUMERIC,
+  due_date TEXT,
+  status TEXT,
+  pix_code TEXT,
+  client_name TEXT,
+  whatsapp TEXT,
+  phone TEXT,
+  days_overdue NUMERIC
+)
+LANGUAGE sql STABLE AS $$
+  SELECT
+    ch.id, ch.client_id, ch.description, ch.type, ch.value, ch.due_date, ch.status, ch.pix_code,
+    c.name AS client_name, c.whatsapp, c.phone,
+    EXTRACT(EPOCH FROM (CURRENT_DATE - ch.due_date::date)) / 86400 AS days_overdue
+  FROM charges ch
+  JOIN clients c ON ch.client_id = c.id
+  WHERE ch.status = 'overdue'
+  ORDER BY days_overdue DESC;
+$$;
+
+-- Top clients by revenue
+CREATE OR REPLACE FUNCTION get_top_clients(row_limit INT DEFAULT 10)
+RETURNS TABLE (
+  id INT,
+  name TEXT,
+  phone TEXT,
+  plan_type TEXT,
+  total_billed NUMERIC,
+  charge_count BIGINT,
+  service_count BIGINT
+)
+LANGUAGE sql STABLE AS $$
+  SELECT
+    c.id, c.name, c.phone, c.plan_type,
+    COALESCE(SUM(ch.value), 0) AS total_billed,
+    COUNT(DISTINCT ch.id) AS charge_count,
+    COUNT(DISTINCT s.id) AS service_count
+  FROM clients c
+  LEFT JOIN charges ch ON ch.client_id = c.id AND ch.status = 'paid'
+  LEFT JOIN services s ON s.client_id = c.id AND s.status = 'completed'
+  WHERE c.status = 'active'
+  GROUP BY c.id
+  ORDER BY total_billed DESC
+  LIMIT row_limit;
+$$;
+
+-- At-risk clients (low rating or overdue)
+CREATE OR REPLACE FUNCTION get_at_risk_clients()
+RETURNS TABLE (
+  id INT,
+  name TEXT,
+  phone TEXT,
+  whatsapp TEXT,
+  avg_rating NUMERIC,
+  overdue_count BIGINT,
+  overdue_amount NUMERIC
+)
+LANGUAGE sql STABLE AS $$
+  SELECT
+    c.id, c.name, c.phone, c.whatsapp,
+    COALESCE(AVG(s.rating), 0) AS avg_rating,
+    COUNT(CASE WHEN ch.status = 'overdue' THEN 1 END) AS overdue_count,
+    COALESCE(SUM(CASE WHEN ch.status = 'overdue' THEN ch.value END), 0) AS overdue_amount
+  FROM clients c
+  LEFT JOIN services s ON s.client_id = c.id
+    AND s.rating IS NOT NULL
+    AND s.completed_date >= to_char(CURRENT_DATE - INTERVAL '90 days', 'YYYY-MM-DD')
+  LEFT JOIN charges ch ON ch.client_id = c.id
+  WHERE c.status = 'active'
+  GROUP BY c.id
+  HAVING
+    (AVG(s.rating) > 0 AND AVG(s.rating) <= 2.5) OR
+    COUNT(CASE WHEN ch.status = 'overdue' THEN 1 END) > 0
+  ORDER BY overdue_amount DESC, avg_rating ASC;
+$$;
+
+-- Product consumption by month
+CREATE OR REPLACE FUNCTION get_product_consumption(month_start TEXT, month_end TEXT)
+RETURNS TABLE (
+  name TEXT,
+  unit TEXT,
+  cost_price NUMERIC,
+  total_used NUMERIC,
+  total_cost NUMERIC
+)
+LANGUAGE sql STABLE AS $$
+  SELECT
+    p.name, p.unit, p.cost_price,
+    COALESCE(SUM(sm.quantity), 0) AS total_used,
+    COALESCE(SUM(sm.quantity * p.cost_price), 0) AS total_cost
+  FROM stock_movements sm
+  JOIN products p ON sm.product_id = p.id
+  WHERE sm.type = 'out'
+    AND sm.reference_type = 'service'
+    AND sm.created_at >= month_start
+    AND sm.created_at <= month_end
+  GROUP BY p.id, p.name, p.unit, p.cost_price
+  ORDER BY total_cost DESC;
+$$;
+
+-- Product cost for DRE report
+CREATE OR REPLACE FUNCTION get_product_cost_by_month(month_start TEXT, month_end TEXT)
+RETURNS TABLE (total NUMERIC)
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(SUM(sm.quantity * p.cost_price), 0) AS total
+  FROM stock_movements sm
+  JOIN products p ON sm.product_id = p.id
+  WHERE sm.type = 'out'
+    AND sm.reference_type = 'service'
+    AND sm.created_at >= month_start
+    AND sm.created_at <= month_end;
+$$;
+
+-- Supabase Storage: create these buckets manually in the dashboard:
+-- 1. Bucket name: "photos"   — Public: true
+-- 2. Bucket name: "contracts" — Public: false (or true if you want direct URL access)

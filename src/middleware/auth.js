@@ -1,6 +1,10 @@
 const jwt = require('jsonwebtoken');
-const { getDb } = require('../../database/db');
-const JWT_SECRET = process.env.JWT_SECRET || 'verde-azul-secret-2025';
+const { supabase } = require('../../database/db');
+
+if (!process.env.JWT_SECRET) {
+  throw new Error('Missing required environment variable: JWT_SECRET must be set.');
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 
 async function authenticate(req, res, next) {
   const header = req.headers.authorization;
@@ -10,10 +14,20 @@ async function authenticate(req, res, next) {
   try {
     const token = header.split(' ')[1];
     const decoded = jwt.verify(token, JWT_SECRET);
-    const db = getDb();
-    const user = await db.prepare("SELECT u.*, r.name as role_name, r.permissions FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = $1 AND u.status = 'active'").get(decoded.userId);
-    if (!user) return res.status(401).json({ error: 'Usuario invalido ou inativo' });
-    user.permissions = JSON.parse(user.permissions || '{}');
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*, roles(name, permissions)')
+      .eq('id', decoded.userId)
+      .eq('status', 'active')
+      .single();
+
+    if (error || !user) return res.status(401).json({ error: 'Usuario invalido ou inativo' });
+
+    // Flatten role fields
+    user.role_name = user.roles?.name;
+    user.permissions = JSON.parse(user.roles?.permissions || '{}');
+    delete user.roles;
     delete user.password_hash;
     req.user = user;
     next();

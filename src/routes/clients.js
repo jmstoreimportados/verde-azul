@@ -1,70 +1,110 @@
 const express = require('express');
-const path = require('path');
 const multer = require('multer');
-const { getDb } = require('../../database/db');
+const { supabase } = require('../../database/db');
 const { authenticate } = require('../middleware/auth');
 const { generateRecurringServices, generateMonthlyCharge } = require('../utils/generators');
 const router = express.Router();
 
-const uploadDir = process.env.NODE_ENV === 'production' ? '/tmp/contracts' : path.join(__dirname, '../../uploads/contracts');
-const contractStorage = multer.diskStorage({
-  destination: (req, file, cb) => { require('fs').mkdirSync(uploadDir, { recursive: true }); cb(null, uploadDir); },
-  filename: (req, file, cb) => cb(null, `contract_${req.params.id}_${Date.now()}${path.extname(file.originalname)}`)
-});
-const upload = multer({ storage: contractStorage, limits: { fileSize: 10 * 1024 * 1024 } });
+const isProd = process.env.NODE_ENV === 'production';
+const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
+
+// Use memory storage — files go to Supabase Storage, not disk
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // Listar clientes
 router.get('/', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const { search, status, service_type } = req.query;
-    let query = `SELECT c.*, e.name as employee_name FROM clients c LEFT JOIN employees e ON c.responsible_employee_id = e.id WHERE 1=1`;
-    const params = [];
-    let i = 1;
+    const { search, status } = req.query;
 
-    if (status) { query += ` AND c.status = $${i++}`; params.push(status); }
+    let query = supabase
+      .from('clients')
+      .select('*, employees(name)')
+      .order('name');
+
+    if (status) query = query.eq('status', status);
     if (search) {
-      query += ` AND (c.name ILIKE $${i} OR c.phone LIKE $${i+1} OR c.cpf LIKE $${i+2})`;
-      params.push(`%${search}%`, `%${search}%`, `%${search}%`); i += 3;
+      query = query.or(`name.ilike.%${search}%,phone.ilike.%${search}%,cpf.ilike.%${search}%`);
     }
-    query += ' ORDER BY c.name';
 
-    const clients = await db.prepare(query).all(...params);
-    for (const c of clients) {
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Get overdue status for each client
+    for (const c of data) {
+      c.employee_name = c.employees?.name || null;
+      delete c.employees;
       c.service_types = JSON.parse(c.service_types || '[]');
-      const overdue = await db.prepare("SELECT COUNT(*) as cnt FROM charges WHERE client_id = $1 AND status = 'overdue'").get(c.id);
-      c.has_overdue = parseInt(overdue.cnt) > 0;
+
+      const { count } = await supabase
+        .from('charges')
+        .select('*', { count: 'exact', head: true })
+        .eq('client_id', c.id)
+        .eq('status', 'overdue');
+      c.has_overdue = (count || 0) > 0;
     }
-    res.json(clients);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Buscar cliente por ID
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const client = await db.prepare('SELECT c.*, e.name as employee_name FROM clients c LEFT JOIN employees e ON c.responsible_employee_id = e.id WHERE c.id = $1').get(req.params.id);
-    if (!client) return res.status(404).json({ error: 'Cliente nao encontrado' });
+    const { data: client, error } = await supabase
+      .from('clients')
+      .select('*, employees(name)')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !client) return res.status(404).json({ error: 'Cliente nao encontrado' });
+
+    client.employee_name = client.employees?.name || null;
+    delete client.employees;
     client.service_types = JSON.parse(client.service_types || '[]');
 
-    const charges = await db.prepare('SELECT * FROM charges WHERE client_id = $1 ORDER BY due_date DESC LIMIT 20').all(client.id);
-    const services = await db.prepare('SELECT s.*, e.name as employee_name FROM services s LEFT JOIN employees e ON s.employee_id = e.id WHERE s.client_id = $1 ORDER BY s.scheduled_date DESC LIMIT 30').all(client.id);
-    const kit = await db.prepare('SELECT ck.*, p.name as product_name, p.unit FROM client_kits ck JOIN products p ON ck.product_id = p.id WHERE ck.client_id = $1').all(client.id);
+    const { data: charges } = await supabase
+      .from('charges')
+      .select('*')
+      .eq('client_id', client.id)
+      .order('due_date', { ascending: false })
+      .limit(20);
 
-    services.forEach(s => {
-      s.checklist = JSON.parse(s.checklist || '[]');
-      s.water_quality = JSON.parse(s.water_quality || '{}');
-      s.products_used = JSON.parse(s.products_used || '[]');
-      s.photos = JSON.parse(s.photos || '[]');
-    });
-    res.json({ ...client, charges, services, kit });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data: services } = await supabase
+      .from('services')
+      .select('*, employees(name)')
+      .eq('client_id', client.id)
+      .order('scheduled_date', { ascending: false })
+      .limit(30);
+
+    const { data: kit } = await supabase
+      .from('client_kits')
+      .select('*, products(name, unit)')
+      .eq('client_id', client.id);
+
+    const servicesFormatted = (services || []).map(s => ({
+      ...s,
+      employee_name: s.employees?.name || null,
+      employees: undefined,
+      checklist: JSON.parse(s.checklist || '[]'),
+      water_quality: JSON.parse(s.water_quality || '{}'),
+      products_used: JSON.parse(s.products_used || '[]'),
+      photos: JSON.parse(s.photos || '[]')
+    }));
+
+    const kitFormatted = (kit || []).map(k => ({
+      ...k,
+      product_name: k.products?.name,
+      unit: k.products?.unit,
+      products: undefined
+    }));
+
+    res.json({ ...client, charges: charges || [], services: servicesFormatted, kit: kitFormatted });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Criar cliente
 router.post('/', authenticate, async (req, res) => {
   try {
-    const db = getDb();
     const {
       name, cpf, phone, whatsapp, email, address, address_number, neighborhood, city, state, zip_code, reference,
       secondary_contact_name, secondary_contact_phone, secondary_contact_relation,
@@ -73,34 +113,54 @@ router.post('/', authenticate, async (req, res) => {
     } = req.body;
     if (!name || !phone || !address) return res.status(400).json({ error: 'Nome, telefone e endereco obrigatorios' });
 
-    const result = await db.prepare(`INSERT INTO clients (name,cpf,phone,whatsapp,email,address,address_number,neighborhood,city,state,zip_code,reference,secondary_contact_name,secondary_contact_phone,secondary_contact_relation,service_types,frequency,preferred_day,plan_type,monthly_value,payment_day,responsible_employee_id,start_date,notes,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,'active')`).run(
-      name, cpf||null, phone, whatsapp||phone, email||null,
-      address, address_number||null, neighborhood||null, city||null, state||'SP', zip_code||null, reference||null,
-      secondary_contact_name||null, secondary_contact_phone||null, secondary_contact_relation||null,
-      JSON.stringify(service_types||[]), frequency||'monthly', preferred_day||null,
-      plan_type||'basic', monthly_value||0, payment_day||10,
-      responsible_employee_id||null, start_date||new Date().toISOString().split('T')[0], notes||null
-    );
-    const clientId = result.lastInsertRowid;
+    const { data, error } = await supabase
+      .from('clients')
+      .insert({
+        name, cpf: cpf || null, phone, whatsapp: whatsapp || phone, email: email || null,
+        address, address_number: address_number || null, neighborhood: neighborhood || null,
+        city: city || null, state: state || 'SP', zip_code: zip_code || null, reference: reference || null,
+        secondary_contact_name: secondary_contact_name || null,
+        secondary_contact_phone: secondary_contact_phone || null,
+        secondary_contact_relation: secondary_contact_relation || null,
+        service_types: JSON.stringify(service_types || []),
+        frequency: frequency || 'monthly',
+        preferred_day: preferred_day || null,
+        plan_type: plan_type || 'basic',
+        monthly_value: monthly_value || 0,
+        payment_day: payment_day || 10,
+        responsible_employee_id: responsible_employee_id || null,
+        start_date: start_date || new Date().toISOString().split('T')[0],
+        notes: notes || null,
+        status: 'active'
+      })
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    const clientId = data.id;
 
     if (plan_type === 'complete' && kit && kit.length > 0) {
       for (const item of kit) {
-        await db.prepare('INSERT INTO client_kits (client_id, product_id, quantity) VALUES ($1, $2, $3)').run(clientId, item.product_id, item.quantity);
+        await supabase.from('client_kits').insert({
+          client_id: clientId, product_id: item.product_id, quantity: item.quantity
+        });
       }
     }
 
-    await generateRecurringServices(db, clientId, start_date || new Date().toISOString().split('T')[0]);
-    if (monthly_value > 0) await generateMonthlyCharge(db, clientId);
-    await db.prepare('INSERT INTO activity_log (user_id, action, entity, entity_id) VALUES ($1, $2, $3, $4)').run(req.user.id, 'create', 'client', clientId);
+    await generateRecurringServices(clientId, start_date || new Date().toISOString().split('T')[0]);
+    if (monthly_value > 0) await generateMonthlyCharge(clientId);
+
+    await supabase.from('activity_log').insert({
+      user_id: req.user.id, action: 'create', entity: 'client', entity_id: clientId
+    });
 
     res.json({ id: clientId, message: 'Cliente cadastrado com sucesso' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Atualizar cliente
 router.put('/:id', authenticate, async (req, res) => {
   try {
-    const db = getDb();
     const id = req.params.id;
     const {
       name, cpf, phone, whatsapp, email, address, address_number, neighborhood, city, state, zip_code, reference,
@@ -109,48 +169,82 @@ router.put('/:id', authenticate, async (req, res) => {
       responsible_employee_id, start_date, status, notes, kit
     } = req.body;
 
-    await db.prepare(`UPDATE clients SET name=$1,cpf=$2,phone=$3,whatsapp=$4,email=$5,address=$6,address_number=$7,neighborhood=$8,city=$9,state=$10,zip_code=$11,reference=$12,secondary_contact_name=$13,secondary_contact_phone=$14,secondary_contact_relation=$15,service_types=$16,frequency=$17,preferred_day=$18,plan_type=$19,monthly_value=$20,payment_day=$21,responsible_employee_id=$22,start_date=$23,status=$24,notes=$25 WHERE id=$26`).run(
-      name, cpf||null, phone, whatsapp||phone, email||null,
-      address, address_number||null, neighborhood||null, city||null, state||'SP', zip_code||null, reference||null,
-      secondary_contact_name||null, secondary_contact_phone||null, secondary_contact_relation||null,
-      JSON.stringify(service_types||[]), frequency, preferred_day||null,
-      plan_type||'basic', monthly_value||0, payment_day||10,
-      responsible_employee_id||null, start_date, status||'active', notes||null, id
-    );
+    const { error } = await supabase
+      .from('clients')
+      .update({
+        name, cpf: cpf || null, phone, whatsapp: whatsapp || phone, email: email || null,
+        address, address_number: address_number || null, neighborhood: neighborhood || null,
+        city: city || null, state: state || 'SP', zip_code: zip_code || null, reference: reference || null,
+        secondary_contact_name: secondary_contact_name || null,
+        secondary_contact_phone: secondary_contact_phone || null,
+        secondary_contact_relation: secondary_contact_relation || null,
+        service_types: JSON.stringify(service_types || []),
+        frequency, preferred_day: preferred_day || null,
+        plan_type: plan_type || 'basic', monthly_value: monthly_value || 0, payment_day: payment_day || 10,
+        responsible_employee_id: responsible_employee_id || null,
+        start_date, status: status || 'active', notes: notes || null
+      })
+      .eq('id', id);
+
+    if (error) throw error;
 
     if (kit !== undefined) {
-      await db.prepare('DELETE FROM client_kits WHERE client_id = $1').run(id);
+      await supabase.from('client_kits').delete().eq('client_id', id);
       if (plan_type === 'complete' && kit && kit.length > 0) {
         for (const item of kit) {
-          await db.prepare('INSERT INTO client_kits (client_id, product_id, quantity) VALUES ($1, $2, $3)').run(id, item.product_id, item.quantity);
+          await supabase.from('client_kits').insert({
+            client_id: id, product_id: item.product_id, quantity: item.quantity
+          });
         }
       }
     }
+
     res.json({ message: 'Cliente atualizado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
-// Upload de contrato
+// Upload de contrato → Supabase Storage
 router.post('/:id/contract', authenticate, upload.single('contract'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Arquivo nao enviado' });
-    const db = getDb();
-    await db.prepare('UPDATE clients SET contract_file = $1 WHERE id = $2').run(req.file.filename, req.params.id);
-    res.json({ filename: req.file.filename, message: 'Contrato salvo' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const ext = req.file.originalname.split('.').pop();
+    const filePath = `contracts/contract_${req.params.id}_${Date.now()}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('contracts')
+      .upload(filePath, req.file.buffer, { contentType: req.file.mimetype, upsert: true });
+
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage.from('contracts').getPublicUrl(filePath);
+    const publicUrl = urlData.publicUrl;
+
+    const { error } = await supabase
+      .from('clients')
+      .update({ contract_file: publicUrl })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ url: publicUrl, message: 'Contrato salvo' });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Gerar contrato PDF
 router.get('/:id/contract/generate', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const client = await db.prepare('SELECT * FROM clients WHERE id = $1').get(req.params.id);
-    if (!client) return res.status(404).json({ error: 'Cliente nao encontrado' });
+    const { data: client, error } = await supabase
+      .from('clients')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !client) return res.status(404).json({ error: 'Cliente nao encontrado' });
     client.service_types = JSON.parse(client.service_types || '[]');
 
-    const settingsRows = await db.prepare('SELECT key, value FROM settings').all();
+    const { data: settingsRows } = await supabase.from('settings').select('key, value');
     const settings = {};
-    settingsRows.forEach(s => settings[s.key] = s.value);
+    (settingsRows || []).forEach(s => settings[s.key] = s.value);
 
     const PDFDocument = require('pdfkit');
     const doc = new PDFDocument({ margin: 60 });
@@ -175,17 +269,20 @@ router.get('/:id/contract/generate', authenticate, async (req, res) => {
 
     doc.fontSize(12).font('Helvetica').text(filled, { align: 'left', lineGap: 4 });
     doc.end();
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Log de mensagem
 router.post('/:id/message-log', authenticate, async (req, res) => {
   try {
     const { type, message } = req.body;
-    const db = getDb();
-    await db.prepare('INSERT INTO message_log (client_id, type, message) VALUES ($1, $2, $3)').run(req.params.id, type, message);
+    const { error } = await supabase
+      .from('message_log')
+      .insert({ client_id: req.params.id, type, message });
+
+    if (error) throw error;
     res.json({ message: 'Log registrado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 module.exports = router;

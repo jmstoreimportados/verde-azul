@@ -1,27 +1,46 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { getDb } = require('../../database/db');
+const { supabase } = require('../../database/db');
 const { authenticate, JWT_SECRET } = require('../middleware/auth');
 const router = express.Router();
+
+const isProd = process.env.NODE_ENV === 'production';
+const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
 
 // Login
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'E-mail e senha obrigatorios' });
-    const db = getDb();
-    const user = await db.prepare("SELECT u.*, r.name as role_name, r.permissions FROM users u JOIN roles r ON u.role_id = r.id WHERE u.email = $1 AND u.status = 'active'").get(email.toLowerCase().trim());
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+
+    const emailClean = email.trim().toLowerCase();
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*, roles(name, permissions)')
+      .eq('email', emailClean)
+      .eq('status', 'active')
+      .single();
+
+    if (error || !user || !bcrypt.compareSync(password, user.password_hash)) {
       return res.status(401).json({ error: 'E-mail ou senha incorretos' });
     }
-    await db.prepare("UPDATE users SET last_login = $1 WHERE id = $2").run(new Date().toISOString().split('T')[0], user.id);
+
+    await supabase
+      .from('users')
+      .update({ last_login: new Date().toISOString().split('T')[0] })
+      .eq('id', user.id);
+
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '12h' });
     const userData = { ...user };
     delete userData.password_hash;
-    userData.permissions = JSON.parse(userData.permissions || '{}');
+    userData.role_name = userData.roles?.name;
+    userData.permissions = JSON.parse(userData.roles?.permissions || '{}');
+    delete userData.roles;
+
     res.json({ token, user: userData });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Perfil atual
@@ -35,24 +54,46 @@ router.post('/change-password', authenticate, async (req, res) => {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) return res.status(400).json({ error: 'Campos obrigatorios' });
     if (new_password.length < 6) return res.status(400).json({ error: 'Senha deve ter pelo menos 6 caracteres' });
-    const db = getDb();
-    const user = await db.prepare('SELECT * FROM users WHERE id = $1').get(req.user.id);
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('password_hash')
+      .eq('id', req.user.id)
+      .single();
+
+    if (error || !user) return res.status(404).json({ error: 'Usuario nao encontrado' });
     if (!bcrypt.compareSync(current_password, user.password_hash)) {
       return res.status(400).json({ error: 'Senha atual incorreta' });
     }
+
     const hash = bcrypt.hashSync(new_password, 10);
-    await db.prepare('UPDATE users SET password_hash = $1 WHERE id = $2').run(hash, req.user.id);
+    const { error: updateErr } = await supabase
+      .from('users')
+      .update({ password_hash: hash })
+      .eq('id', req.user.id);
+
+    if (updateErr) throw updateErr;
     res.json({ message: 'Senha alterada com sucesso' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Listar usuarios
 router.get('/users', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const users = await db.prepare('SELECT u.id, u.name, u.email, u.status, u.last_login, u.created_at, r.name as role_name, r.id as role_id FROM users u JOIN roles r ON u.role_id = r.id ORDER BY u.name').all();
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, name, email, status, last_login, created_at, roles(id, name)')
+      .order('name');
+
+    if (error) throw error;
+    const users = data.map(u => ({
+      ...u,
+      role_id: u.roles?.id,
+      role_name: u.roles?.name,
+      roles: undefined
+    }));
     res.json(users);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Criar usuario
@@ -60,47 +101,73 @@ router.post('/users', authenticate, async (req, res) => {
   try {
     const { name, email, password, role_id } = req.body;
     if (!name || !email || !password || !role_id) return res.status(400).json({ error: 'Campos obrigatorios' });
-    const db = getDb();
-    const exists = await db.prepare('SELECT id FROM users WHERE email = $1').get(email.toLowerCase());
+
+    const emailClean = email.trim().toLowerCase();
+    const { data: exists } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', emailClean)
+      .maybeSingle();
+
     if (exists) return res.status(400).json({ error: 'E-mail ja cadastrado' });
+
     const hash = bcrypt.hashSync(password, 10);
-    const result = await db.prepare('INSERT INTO users (name, email, password_hash, role_id) VALUES ($1, $2, $3, $4)').run(name, email.toLowerCase(), hash, role_id);
-    res.json({ id: result.lastInsertRowid, message: 'Usuario criado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data, error } = await supabase
+      .from('users')
+      .insert({ name, email: emailClean, password_hash: hash, role_id })
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    res.json({ id: data.id, message: 'Usuario criado' });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Atualizar usuario
 router.put('/users/:id', authenticate, async (req, res) => {
   try {
     const { name, email, role_id, status, new_password } = req.body;
-    const db = getDb();
+    const updateData = { name, email: email.trim().toLowerCase(), role_id, status };
+
     if (new_password && new_password.length >= 6) {
-      await db.prepare('UPDATE users SET name = $1, email = $2, role_id = $3, status = $4, password_hash = $5 WHERE id = $6').run(name, email.toLowerCase(), role_id, status, bcrypt.hashSync(new_password, 10), req.params.id);
-    } else {
-      await db.prepare('UPDATE users SET name = $1, email = $2, role_id = $3, status = $4 WHERE id = $5').run(name, email.toLowerCase(), role_id, status, req.params.id);
+      updateData.password_hash = bcrypt.hashSync(new_password, 10);
     }
+
+    const { error } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', req.params.id);
+
+    if (error) throw error;
     res.json({ message: 'Usuario atualizado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Listar roles
 router.get('/roles', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const roles = await db.prepare('SELECT * FROM roles ORDER BY id').all();
-    roles.forEach(r => r.permissions = JSON.parse(r.permissions));
-    res.json(roles);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data, error } = await supabase
+      .from('roles')
+      .select('*')
+      .order('id');
+
+    if (error) throw error;
+    res.json(data.map(r => ({ ...r, permissions: JSON.parse(r.permissions || '{}') })));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Atualizar permissoes de um role
 router.put('/roles/:id', authenticate, async (req, res) => {
   try {
     const { name, permissions } = req.body;
-    const db = getDb();
-    await db.prepare('UPDATE roles SET name = $1, permissions = $2 WHERE id = $3').run(name, JSON.stringify(permissions), req.params.id);
+    const { error } = await supabase
+      .from('roles')
+      .update({ name, permissions: JSON.stringify(permissions) })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
     res.json({ message: 'Permissoes atualizadas' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 module.exports = router;

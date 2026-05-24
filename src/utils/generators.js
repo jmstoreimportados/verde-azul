@@ -1,14 +1,30 @@
+/**
+ * generators.js — Utility functions for recurring service and charge generation
+ * Rewritten to use @supabase/supabase-js directly (no db wrapper)
+ */
+const { supabase } = require('../../database/db');
+
 // Gera servicos recorrentes para um cliente
-async function generateRecurringServices(db, clientId, startDate) {
-  const client = await db.prepare('SELECT * FROM clients WHERE id = $1').get(clientId);
-  if (!client || client.frequency === 'ondemand') return;
+async function generateRecurringServices(clientId, startDate) {
+  const { data: client, error } = await supabase
+    .from('clients')
+    .select('*')
+    .eq('id', clientId)
+    .single();
+
+  if (error || !client || client.frequency === 'ondemand') return;
 
   client.service_types = JSON.parse(client.service_types || '[]');
   const today = new Date(startDate);
   const endOfNextMonth = new Date(today.getFullYear(), today.getMonth() + 2, 0);
 
-  const existing = await db.prepare("SELECT scheduled_date FROM services WHERE client_id = $1 AND status = 'scheduled'").all(clientId);
-  const existingDates = new Set(existing.map(s => s.scheduled_date));
+  const { data: existing } = await supabase
+    .from('services')
+    .select('scheduled_date')
+    .eq('client_id', clientId)
+    .eq('status', 'scheduled');
+
+  const existingDates = new Set((existing || []).map(s => s.scheduled_date));
 
   const category = client.service_types.includes('pool') && client.service_types.includes('garden') ? 'both'
     : client.service_types.includes('pool') ? 'pool' : 'garden';
@@ -37,7 +53,10 @@ async function generateRecurringServices(db, clientId, startDate) {
       d.setDate(d.getDate() + 14);
     }
   } else if (client.frequency === 'monthly') {
-    const months = [new Date(today.getFullYear(), today.getMonth(), 1), new Date(today.getFullYear(), today.getMonth() + 1, 1)];
+    const months = [
+      new Date(today.getFullYear(), today.getMonth(), 1),
+      new Date(today.getFullYear(), today.getMonth() + 1, 1)
+    ];
     for (const m of months) {
       let d;
       if (preferred !== null && preferred !== undefined) {
@@ -50,20 +69,29 @@ async function generateRecurringServices(db, clientId, startDate) {
     }
   }
 
-  const insertService = db.prepare(`INSERT INTO services (client_id, type, service_category, scheduled_date, status, employee_id, is_recurring, recurrence_group) VALUES ($1, $2, $3, $4, 'scheduled', $5, 1, $6)`);
   const groupId = `rec_${clientId}_${Date.now()}`;
-
   for (const date of dates) {
     if (!existingDates.has(date)) {
-      await insertService.run(clientId, 'maintenance', category, date, client.responsible_employee_id || null, groupId);
+      await supabase.from('services').insert({
+        client_id: clientId, type: 'maintenance', service_category: category,
+        scheduled_date: date, status: 'scheduled',
+        employee_id: client.responsible_employee_id || null,
+        is_recurring: 1, recurrence_group: groupId
+      });
     }
   }
 }
 
 // Gera cobranca mensal para um cliente
-async function generateMonthlyCharge(db, clientId, month, year) {
-  const client = await db.prepare("SELECT * FROM clients WHERE id = $1 AND status = 'active'").get(clientId);
-  if (!client || !client.monthly_value) return;
+async function generateMonthlyCharge(clientId, month, year) {
+  const { data: client, error } = await supabase
+    .from('clients')
+    .select('*')
+    .eq('id', clientId)
+    .eq('status', 'active')
+    .single();
+
+  if (error || !client || !client.monthly_value) return;
 
   const now = new Date();
   const m = month !== undefined ? month : now.getMonth();
@@ -71,47 +99,72 @@ async function generateMonthlyCharge(db, clientId, month, year) {
 
   const dueDate = `${y}-${String(m + 1).padStart(2, '0')}-${String(client.payment_day).padStart(2, '0')}`;
 
-  const exists = await db.prepare("SELECT id FROM charges WHERE client_id = $1 AND due_date = $2 AND type = 'monthly'").get(clientId, dueDate);
+  const { data: exists } = await supabase
+    .from('charges')
+    .select('id')
+    .eq('client_id', clientId)
+    .eq('due_date', dueDate)
+    .eq('type', 'monthly')
+    .maybeSingle();
+
   if (exists) return;
 
   const monthNames = ['Janeiro','Fevereiro','Marco','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
   const description = `Mensalidade ${monthNames[m]}/${y}`;
+  const pixCode = await generatePixCode(client.monthly_value);
 
-  const pixCode = await generatePixCode(db, client.monthly_value);
-  await db.prepare("INSERT INTO charges (client_id, description, type, value, due_date, status, pix_code) VALUES ($1, $2, 'monthly', $3, $4, 'pending', $5)").run(clientId, description, client.monthly_value, dueDate, pixCode);
+  await supabase.from('charges').insert({
+    client_id: clientId, description, type: 'monthly',
+    value: client.monthly_value, due_date: dueDate,
+    status: 'pending', pix_code: pixCode
+  });
 }
 
 // Gerar cobranças mensais para todos os clientes ativos
-async function generateAllMonthlyCharges(db) {
+async function generateAllMonthlyCharges() {
   const now = new Date();
-  const clients = await db.prepare("SELECT id FROM clients WHERE status = 'active'").all();
-  for (const c of clients) {
-    await generateMonthlyCharge(db, c.id, now.getMonth(), now.getFullYear());
+  const { data: clients } = await supabase
+    .from('clients')
+    .select('id')
+    .eq('status', 'active');
+
+  for (const c of (clients || [])) {
+    await generateMonthlyCharge(c.id, now.getMonth(), now.getFullYear());
   }
 }
 
 // Gerar agendamentos mensais para todos os clientes
-async function generateAllMonthlyServices(db) {
-  const clients = await db.prepare("SELECT * FROM clients WHERE status = 'active' AND frequency != 'ondemand'").all();
+async function generateAllMonthlyServices() {
+  const { data: clients } = await supabase
+    .from('clients')
+    .select('*')
+    .eq('status', 'active')
+    .neq('frequency', 'ondemand');
+
   const nextMonth = new Date();
   nextMonth.setMonth(nextMonth.getMonth() + 1);
   const startDate = `${nextMonth.getFullYear()}-${String(nextMonth.getMonth() + 1).padStart(2, '0')}-01`;
-  for (const c of clients) {
-    await generateRecurringServices(db, c.id, startDate);
+
+  for (const c of (clients || [])) {
+    await generateRecurringServices(c.id, startDate);
   }
 }
 
 // Atualizar cobranças vencidas
-async function updateOverdueCharges(db) {
+async function updateOverdueCharges() {
   const today = new Date().toISOString().split('T')[0];
-  await db.prepare("UPDATE charges SET status = 'overdue' WHERE status = 'pending' AND due_date < $1").run(today);
+  await supabase
+    .from('charges')
+    .update({ status: 'overdue' })
+    .eq('status', 'pending')
+    .lt('due_date', today);
 }
 
 // Gerar codigo PIX (formato EMV)
-async function generatePixCode(db, value) {
-  const rows = await db.prepare('SELECT key, value FROM settings').all();
+async function generatePixCode(value) {
+  const { data: rows } = await supabase.from('settings').select('key, value');
   const settings = {};
-  rows.forEach(s => settings[s.key] = s.value);
+  (rows || []).forEach(s => settings[s.key] = s.value);
 
   const pixKey = settings.pix_key || '';
   if (!pixKey) return '';
@@ -154,4 +207,11 @@ async function generatePixCode(db, value) {
   return payload + crc16(payload);
 }
 
-module.exports = { generateRecurringServices, generateMonthlyCharge, generateAllMonthlyCharges, generateAllMonthlyServices, updateOverdueCharges, generatePixCode };
+module.exports = {
+  generateRecurringServices,
+  generateMonthlyCharge,
+  generateAllMonthlyCharges,
+  generateAllMonthlyServices,
+  updateOverdueCharges,
+  generatePixCode
+};

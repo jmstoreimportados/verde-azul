@@ -1,72 +1,88 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const { getDb } = require('../../database/db');
+const { supabase } = require('../../database/db');
 const { authenticate } = require('../middleware/auth');
 const { generatePixCode } = require('../utils/generators');
 const router = express.Router();
 
-const uploadDir = process.env.NODE_ENV === 'production' ? '/tmp/photos' : path.join(__dirname, '../../uploads/photos');
-const photoStorage = multer.diskStorage({
-  destination: (req, file, cb) => { require('fs').mkdirSync(uploadDir, { recursive: true }); cb(null, uploadDir); },
-  filename: (req, file, cb) => cb(null, `svc_${req.params.id}_${Date.now()}${path.extname(file.originalname)}`)
-});
-const upload = multer({ storage: photoStorage, limits: { fileSize: 8 * 1024 * 1024 } });
+const isProd = process.env.NODE_ENV === 'production';
+const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
+
+// Memory storage — uploads go to Supabase Storage
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
+
+function parseService(s) {
+  return {
+    ...s,
+    employee_name: s.employees?.name || null,
+    employees: undefined,
+    client_name: s.clients?.name || null,
+    address: s.clients?.address || null,
+    neighborhood: s.clients?.neighborhood || null,
+    city: s.clients?.city || null,
+    client_whatsapp: s.clients?.whatsapp || null,
+    clients: undefined,
+    checklist: JSON.parse(s.checklist || '[]'),
+    water_quality: JSON.parse(s.water_quality || '{}'),
+    products_used: JSON.parse(s.products_used || '[]'),
+    photos: JSON.parse(s.photos || '[]')
+  };
+}
 
 // Servicos do dia
 router.get('/today', authenticate, async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
-    const db = getDb();
-    let query = `SELECT s.*, c.name as client_name, c.address, c.neighborhood, c.city, c.whatsapp as client_whatsapp, e.name as employee_name FROM services s JOIN clients c ON s.client_id = c.id LEFT JOIN employees e ON s.employee_id = e.id WHERE s.scheduled_date = $1 AND s.status != 'cancelled'`;
-    const params = [today];
-    let i = 2;
+    let query = supabase
+      .from('services')
+      .select('*, clients(name, address, neighborhood, city, whatsapp), employees(name)')
+      .eq('scheduled_date', today)
+      .neq('status', 'cancelled')
+      .order('scheduled_date');
 
+    // Restrict to employee's own services if technician role
     if (req.user.role_name && req.user.role_name.startsWith('Tecnico')) {
-      const emp = await db.prepare('SELECT id FROM employees WHERE name = $1').get(req.user.name);
-      if (emp) { query += ` AND s.employee_id = $${i++}`; params.push(emp.id); }
+      const { data: emp } = await supabase
+        .from('employees')
+        .select('id')
+        .eq('name', req.user.name)
+        .maybeSingle();
+      if (emp) query = query.eq('employee_id', emp.id);
     }
-    query += ' ORDER BY c.name';
-    const services = await db.prepare(query).all(...params);
-    services.forEach(s => {
-      s.checklist = JSON.parse(s.checklist || '[]');
-      s.water_quality = JSON.parse(s.water_quality || '{}');
-      s.products_used = JSON.parse(s.products_used || '[]');
-    });
-    res.json(services);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json((data || []).map(parseService));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Listar servicos com filtros
 router.get('/', authenticate, async (req, res) => {
   try {
     const { start_date, end_date, client_id, employee_id, status, month, year } = req.query;
-    const db = getDb();
-    let query = `SELECT s.*, c.name as client_name, c.address, c.neighborhood, c.whatsapp as client_whatsapp, e.name as employee_name FROM services s JOIN clients c ON s.client_id = c.id LEFT JOIN employees e ON s.employee_id = e.id WHERE 1=1`;
-    const params = [];
-    let i = 1;
+
+    let query = supabase
+      .from('services')
+      .select('*, clients(name, address, neighborhood, whatsapp), employees(name)')
+      .order('scheduled_date')
+      .order('client_id');
 
     if (month && year) {
-      query += ` AND s.scheduled_date LIKE $${i++}`;
-      params.push(`${year}-${String(month).padStart(2,'0')}-%`);
+      query = query
+        .gte('scheduled_date', `${year}-${String(month).padStart(2,'0')}-01`)
+        .lte('scheduled_date', `${year}-${String(month).padStart(2,'0')}-31`);
     } else {
-      if (start_date) { query += ` AND s.scheduled_date >= $${i++}`; params.push(start_date); }
-      if (end_date) { query += ` AND s.scheduled_date <= $${i++}`; params.push(end_date); }
+      if (start_date) query = query.gte('scheduled_date', start_date);
+      if (end_date) query = query.lte('scheduled_date', end_date);
     }
-    if (client_id) { query += ` AND s.client_id = $${i++}`; params.push(client_id); }
-    if (employee_id) { query += ` AND s.employee_id = $${i++}`; params.push(employee_id); }
-    if (status) { query += ` AND s.status = $${i++}`; params.push(status); }
-    query += ' ORDER BY s.scheduled_date, c.name';
+    if (client_id) query = query.eq('client_id', client_id);
+    if (employee_id) query = query.eq('employee_id', employee_id);
+    if (status) query = query.eq('status', status);
 
-    const services = await db.prepare(query).all(...params);
-    services.forEach(s => {
-      s.checklist = JSON.parse(s.checklist || '[]');
-      s.water_quality = JSON.parse(s.water_quality || '{}');
-      s.products_used = JSON.parse(s.products_used || '[]');
-      s.photos = JSON.parse(s.photos || '[]');
-    });
-    res.json(services);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json((data || []).map(parseService));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Criar servico avulso
@@ -74,112 +90,193 @@ router.post('/', authenticate, async (req, res) => {
   try {
     const { client_id, type, service_category, scheduled_date, employee_id, notes, generates_charge, extra_value } = req.body;
     if (!client_id || !scheduled_date) return res.status(400).json({ error: 'Campos obrigatorios' });
-    const db = getDb();
-    const result = await db.prepare("INSERT INTO services (client_id, type, service_category, scheduled_date, employee_id, notes, is_recurring, generates_charge, extra_value) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)").run(client_id, type||'extra', service_category||'pool', scheduled_date, employee_id||null, notes||null, generates_charge?1:0, extra_value||0);
-    res.json({ id: result.lastInsertRowid, message: 'Servico agendado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const { data, error } = await supabase
+      .from('services')
+      .insert({
+        client_id, type: type || 'extra', service_category: service_category || 'pool',
+        scheduled_date, employee_id: employee_id || null, notes: notes || null,
+        is_recurring: 0, generates_charge: generates_charge ? 1 : 0, extra_value: extra_value || 0
+      })
+      .select('id')
+      .single();
+
+    if (error) throw error;
+    res.json({ id: data.id, message: 'Servico agendado' });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Atualizar servico
 router.put('/:id', authenticate, async (req, res) => {
   try {
     const { scheduled_date, employee_id, status, notes } = req.body;
-    const db = getDb();
-    await db.prepare("UPDATE services SET scheduled_date=$1, employee_id=$2, status=$3, notes=$4 WHERE id=$5").run(scheduled_date, employee_id||null, status||'scheduled', notes||null, req.params.id);
+    const { error } = await supabase
+      .from('services')
+      .update({ scheduled_date, employee_id: employee_id || null, status: status || 'scheduled', notes: notes || null })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
     res.json({ message: 'Servico atualizado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Notificar chegada
 router.post('/:id/notify-arrival', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    await db.prepare('UPDATE services SET notified_arrival = 1 WHERE id = $1').run(req.params.id);
-    const svc = await db.prepare('SELECT s.*, c.name as client_name, c.whatsapp, e.name as employee_name FROM services s JOIN clients c ON s.client_id = c.id LEFT JOIN employees e ON s.employee_id = e.id WHERE s.id = $1').get(req.params.id);
+    await supabase.from('services').update({ notified_arrival: 1 }).eq('id', req.params.id);
 
-    const settingsRows = await db.prepare('SELECT key, value FROM settings').all();
+    const { data: svc, error } = await supabase
+      .from('services')
+      .select('*, clients(name, whatsapp), employees(name)')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !svc) return res.status(404).json({ error: 'Servico nao encontrado' });
+
+    const { data: settingsRows } = await supabase.from('settings').select('key, value');
     const settings = {};
-    settingsRows.forEach(s => settings[s.key] = s.value);
+    (settingsRows || []).forEach(s => settings[s.key] = s.value);
 
     const catLabel = svc.service_category === 'pool' ? 'piscina' : svc.service_category === 'garden' ? 'jardim' : 'manutencao';
-    let msg = (settings.whatsapp_template_arrival || 'Ola {nome}! Nosso tecnico {tecnico} esta a caminho para o servico de {servico}.')
-      .replace('{nome}', svc.client_name)
-      .replace('{tecnico}', svc.employee_name || 'nosso tecnico')
+    const msg = (settings.whatsapp_template_arrival || 'Ola {nome}! Nosso tecnico {tecnico} esta a caminho para o servico de {servico}.')
+      .replace('{nome}', svc.clients?.name || '')
+      .replace('{tecnico}', svc.employees?.name || 'nosso tecnico')
       .replace('{servico}', catLabel);
 
-    const whatsapp = svc.whatsapp?.replace(/\D/g, '');
+    const whatsapp = svc.clients?.whatsapp?.replace(/\D/g, '');
     const waLink = `https://wa.me/55${whatsapp}?text=${encodeURIComponent(msg)}`;
-    await db.prepare('INSERT INTO message_log (client_id, type, message) VALUES ($1, $2, $3)').run(svc.client_id, 'arrival', msg);
+    await supabase.from('message_log').insert({ client_id: svc.client_id, type: 'arrival', message: msg });
     res.json({ wa_link: waLink, message: msg });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Concluir servico
 router.post('/:id/complete', authenticate, async (req, res) => {
   try {
     const { checklist, water_quality, products_used, visit_notes, generates_charge, extra_value } = req.body;
-    const db = getDb();
     const today = new Date().toISOString().split('T')[0];
 
-    const svc = await db.prepare('SELECT s.*, c.name as client_name, c.whatsapp, c.plan_type, c.monthly_value FROM services s JOIN clients c ON s.client_id = c.id WHERE s.id = $1').get(req.params.id);
-    if (!svc) return res.status(404).json({ error: 'Servico nao encontrado' });
+    const { data: svc, error: fetchErr } = await supabase
+      .from('services')
+      .select('*, clients(name, whatsapp, plan_type, monthly_value)')
+      .eq('id', req.params.id)
+      .single();
 
-    await db.prepare("UPDATE services SET status='completed', completed_date=$1, checklist=$2, water_quality=$3, products_used=$4, visit_notes=$5 WHERE id=$6").run(today, JSON.stringify(checklist||[]), JSON.stringify(water_quality||{}), JSON.stringify(products_used||[]), visit_notes||null, req.params.id);
+    if (fetchErr || !svc) return res.status(404).json({ error: 'Servico nao encontrado' });
 
+    await supabase
+      .from('services')
+      .update({
+        status: 'completed', completed_date: today,
+        checklist: JSON.stringify(checklist || []),
+        water_quality: JSON.stringify(water_quality || {}),
+        products_used: JSON.stringify(products_used || []),
+        visit_notes: visit_notes || null
+      })
+      .eq('id', req.params.id);
+
+    // Update stock for products used
     for (const pu of (products_used || [])) {
       if (pu.product_id && pu.quantity) {
-        await db.prepare('UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id = $2').run(pu.quantity, pu.product_id);
-        await db.prepare("INSERT INTO stock_movements (product_id, type, quantity, reference_id, reference_type) VALUES ($1, 'out', $2, $3, 'service')").run(pu.product_id, pu.quantity, req.params.id);
+        const { data: prod } = await supabase
+          .from('products')
+          .select('stock_quantity')
+          .eq('id', pu.product_id)
+          .single();
+
+        if (prod) {
+          await supabase.from('products')
+            .update({ stock_quantity: Math.max(0, (prod.stock_quantity || 0) - Number(pu.quantity)) })
+            .eq('id', pu.product_id);
+        }
+
+        await supabase.from('stock_movements').insert({
+          product_id: pu.product_id, type: 'out', quantity: pu.quantity,
+          reference_id: req.params.id, reference_type: 'service'
+        });
       }
     }
 
     if (generates_charge && extra_value > 0) {
-      const pixCode = await generatePixCode(db, extra_value);
-      await db.prepare("INSERT INTO charges (client_id, description, type, value, due_date, status, service_id, pix_code) VALUES ($1, $2, 'extra', $3, $4, 'pending', $5, $6)").run(svc.client_id, `Servico extra - ${today}`, extra_value, today, req.params.id, pixCode);
+      const pixCode = await generatePixCode(extra_value);
+      await supabase.from('charges').insert({
+        client_id: svc.client_id, description: `Servico extra - ${today}`,
+        type: 'extra', value: extra_value, due_date: today, status: 'pending',
+        service_id: req.params.id, pix_code: pixCode
+      });
     }
 
-    const settingsRows = await db.prepare('SELECT key, value FROM settings').all();
+    const { data: settingsRows } = await supabase.from('settings').select('key, value');
     const settings = {};
-    settingsRows.forEach(s => settings[s.key] = s.value);
+    (settingsRows || []).forEach(s => settings[s.key] = s.value);
 
     const checklistArr = checklist || [];
     const checklistText = checklistArr.filter(i => i.done).map(i => `v ${i.label}`).join('\n') || 'Servico realizado';
     const productsUsedArr = products_used || [];
-    const productsText = productsUsedArr.length > 0 ? productsUsedArr.map(p => `* ${p.name}: ${p.quantity} ${p.unit}`).join('\n') : 'Nenhum produto aplicado';
+    const productsText = productsUsedArr.length > 0
+      ? productsUsedArr.map(p => `* ${p.name}: ${p.quantity} ${p.unit}`).join('\n')
+      : 'Nenhum produto aplicado';
 
-    const nextSvc = await db.prepare("SELECT scheduled_date FROM services WHERE client_id = $1 AND status = 'scheduled' AND scheduled_date > $2 ORDER BY scheduled_date LIMIT 1").get(svc.client_id, today);
+    const { data: nextSvc } = await supabase
+      .from('services')
+      .select('scheduled_date')
+      .eq('client_id', svc.client_id)
+      .eq('status', 'scheduled')
+      .gt('scheduled_date', today)
+      .order('scheduled_date')
+      .limit(1)
+      .maybeSingle();
+
     const nextDate = nextSvc ? new Date(nextSvc.scheduled_date).toLocaleDateString('pt-BR') : 'A definir';
-
     const catLabel = svc.service_category === 'pool' ? 'Piscina' : svc.service_category === 'garden' ? 'Jardim' : 'Manutencao';
+
     let reportMsg = (settings.whatsapp_template_report || '')
-      .replace('{nome}', svc.client_name)
+      .replace('{nome}', svc.clients?.name || '')
       .replace('{servico}', catLabel)
       .replace('{data}', new Date(today).toLocaleDateString('pt-BR'))
       .replace('{checklist}', checklistText)
       .replace('{produtos}', productsText)
       .replace('{proxima_visita}', nextDate);
 
-    const whatsapp = svc.whatsapp?.replace(/\D/g, '');
+    const whatsapp = svc.clients?.whatsapp?.replace(/\D/g, '');
     const waLink = reportMsg && whatsapp ? `https://wa.me/55${whatsapp}?text=${encodeURIComponent(reportMsg)}` : null;
 
-    await db.prepare('UPDATE services SET report_sent = 1 WHERE id = $1').run(req.params.id);
-    await db.prepare('INSERT INTO message_log (client_id, type, message) VALUES ($1, $2, $3)').run(svc.client_id, 'service_report', reportMsg);
+    await supabase.from('services').update({ report_sent: 1 }).eq('id', req.params.id);
+    await supabase.from('message_log').insert({ client_id: svc.client_id, type: 'service_report', message: reportMsg });
 
     res.json({ message: 'Servico concluido', wa_link: waLink, report_message: reportMsg });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
-// Upload de fotos
+// Upload de fotos → Supabase Storage
 router.post('/:id/photos', authenticate, upload.array('photos', 5), async (req, res) => {
   try {
-    const db = getDb();
-    const svc = await db.prepare('SELECT photos FROM services WHERE id = $1').get(req.params.id);
+    const { data: svc, error: fetchErr } = await supabase
+      .from('services')
+      .select('photos')
+      .eq('id', req.params.id)
+      .single();
+
+    if (fetchErr) throw fetchErr;
     const existingPhotos = JSON.parse(svc?.photos || '[]');
-    const newPhotos = req.files.map(f => f.filename);
-    const allPhotos = [...existingPhotos, ...newPhotos];
-    await db.prepare('UPDATE services SET photos = $1 WHERE id = $2').run(JSON.stringify(allPhotos), req.params.id);
+    const newPhotoUrls = [];
+
+    for (const file of req.files) {
+      const ext = file.originalname.split('.').pop();
+      const filePath = `photos/svc_${req.params.id}_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const { error: uploadErr } = await supabase.storage
+        .from('photos')
+        .upload(filePath, file.buffer, { contentType: file.mimetype });
+
+      if (uploadErr) throw uploadErr;
+      const { data: urlData } = supabase.storage.from('photos').getPublicUrl(filePath);
+      newPhotoUrls.push(urlData.publicUrl);
+    }
+
+    const allPhotos = [...existingPhotos, ...newPhotoUrls];
+    await supabase.from('services').update({ photos: JSON.stringify(allPhotos) }).eq('id', req.params.id);
     res.json({ photos: allPhotos });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Registrar avaliacao
@@ -187,19 +284,28 @@ router.post('/:id/rating', authenticate, async (req, res) => {
   try {
     const { rating, comment } = req.body;
     if (!rating || rating < 1 || rating > 5) return res.status(400).json({ error: 'Avaliacao invalida' });
-    const db = getDb();
-    await db.prepare('UPDATE services SET rating = $1, rating_comment = $2 WHERE id = $3').run(rating, comment||null, req.params.id);
+
+    const { error } = await supabase
+      .from('services')
+      .update({ rating, rating_comment: comment || null })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
     res.json({ message: 'Avaliacao registrada' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Cancelar servico
 router.delete('/:id', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    await db.prepare("UPDATE services SET status = 'cancelled' WHERE id = $1").run(req.params.id);
+    const { error } = await supabase
+      .from('services')
+      .update({ status: 'cancelled' })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
     res.json({ message: 'Servico cancelado' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 module.exports = router;

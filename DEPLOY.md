@@ -1,106 +1,130 @@
-# Verde & Azul Gestao — Deploy: Supabase + Vercel
+# Verde & Azul Gestão — Deploy na Vercel com Supabase
 
-## Acesso Padrao
-- **Email:** admin@verdeazul.com
-- **Senha:** admin123
-> Troque a senha em Configuracoes -> Usuarios apos o primeiro acesso.
+## Pré-requisitos
 
----
-
-## Passo 1 — Criar banco no Supabase (gratuito)
-
-1. Crie conta em https://supabase.com
-2. Clique em **New Project** e preencha nome, senha e regiao
-3. Aguarde o projeto criar (~2 minutos)
-4. Va em **SQL Editor** (menu lateral)
-5. Cole o conteudo do arquivo `supabase-schema.sql` e clique **Run**
-6. As tabelas e dados iniciais serao criados
-
-### Pegar a URL de conexao:
-1. Va em **Settings -> Database**
-2. Clique em **Connection String -> URI**
-3. Copie a string — ela tem formato:
-   ```
-   postgresql://postgres:[SUA-SENHA]@db.[SEU-PROJETO].supabase.co:5432/postgres
-   ```
+- Conta Vercel: https://vercel.com
+- Projeto Supabase criado: https://supabase.com
+- Node.js 18+ (local)
 
 ---
 
-## Passo 2 — Deploy no Vercel (gratuito)
+## Passo 1 — Configurar o banco de dados no Supabase
 
-### Opcao A: Via GitHub (recomendado)
-1. Suba o projeto para um repositorio GitHub
-2. Acesse https://vercel.com e clique em **New Project**
-3. Importe o repositorio do GitHub
-4. Na etapa de configuracao, adicione as variaveis de ambiente:
+1. Acesse seu projeto Supabase → **SQL Editor**
+2. Execute o arquivo `supabase-schema.sql` completo (tabelas + dados iniciais + funções RPC)
+3. Verifique se as tabelas foram criadas na aba **Table Editor**
 
-| Variavel | Valor |
-|----------|-------|
-| `DATABASE_URL` | URL copiada do Supabase |
-| `JWT_SECRET` | Qualquer string longa e aleatoria |
-| `NODE_ENV` | `production` |
-| `CRON_SECRET` | Qualquer string (opcional) |
+---
 
-5. Clique em **Deploy** e aguarde ~1 minuto
-6. Sua URL estara disponivel (ex: `https://verde-azul-gestao.vercel.app`)
+## Passo 2 — Criar buckets de Storage no Supabase
 
-### Opcao B: Via Vercel CLI
+No painel do Supabase → **Storage → Buckets**:
+
+| Bucket      | Público | Finalidade                   |
+|-------------|---------|------------------------------|
+| `photos`    | Sim     | Fotos de serviços             |
+| `contracts` | Não     | Contratos de clientes (PDF)   |
+
+> Se quiser acesso direto aos contratos via URL, marque como público.
+
+---
+
+## Passo 3 — Obter credenciais do Supabase
+
+No painel: **Settings → API**
+
+- **Project URL** → `SUPABASE_URL`
+- **service_role (secret)** → `SUPABASE_SERVICE_ROLE_KEY`
+
+> Use a `service_role` key, não a `anon` key. A service_role bypassa RLS.
+
+---
+
+## Passo 4 — Deploy na Vercel
+
+### Via CLI
+
 ```bash
 npm install -g vercel
-cd verde-azul-gestao
-vercel
-# Siga as instrucoes e adicione as variaveis quando solicitado
+vercel login
+vercel --prod
 ```
 
----
+### Via dashboard
 
-## Passo 3 — Acesso pelo celular dos tecnicos
-
-Apos o deploy, qualquer pessoa com a URL e login acessa pelo celular.
-
-Para salvar como atalho:
-- **Android (Chrome):** Menu -> "Adicionar a tela inicial"
-- **iPhone (Safari):** Compartilhar -> "Adicionar a Tela de Inicio"
+1. Importe o repositório no Vercel
+2. Framework Preset: **Other**
+3. Build Command: (vazio)
+4. Output Directory: (vazio)
+5. Root Directory: `/` (raiz do projeto)
 
 ---
 
-## Tarefas automaticas (Cron)
+## Passo 5 — Configurar variáveis de ambiente na Vercel
 
-O `vercel.json` ja configura um cron que roda todo dia as 9h (horario UTC):
-- Marca cobranças vencidas como "inadimplente"
-- No dia 1 do mes: gera cobranças e agendamentos do mes seguinte
+Em **Settings → Environment Variables**, adicione:
 
-Para usar um cron externo (alternativa gratuita via cron-job.org):
-1. Crie conta em https://cron-job.org
-2. Adicione um job apontando para: `https://[SUA-URL]/api/cron/daily`
-3. Configure para rodar diariamente
+| Variável                   | Valor                                       |
+|----------------------------|---------------------------------------------|
+| `SUPABASE_URL`             | `https://xxxx.supabase.co`                  |
+| `SUPABASE_SERVICE_ROLE_KEY`| `eyJ...` (service_role key)                 |
+| `JWT_SECRET`               | String aleatória longa (use um gerador)      |
+| `NODE_ENV`                 | `production`                                |
+| `CRON_SECRET`              | String aleatória para proteger o cron        |
+| `ALLOWED_ORIGIN`           | URL do seu frontend (ex: `https://verde-azul.vercel.app`) |
 
 ---
 
-## Rodar localmente (sem Vercel)
+## Passo 6 — Configurar Cron Job
+
+O arquivo `vercel.json` já configura o cron para rodar às 9h UTC diariamente:
+
+```json
+"crons": [{ "path": "/api/cron/daily", "schedule": "0 9 * * *" }]
+```
+
+O endpoint verifica o header `x-cron-secret` ou query param `?secret=...`.
+Configure `CRON_SECRET` na Vercel para protegê-lo.
+
+---
+
+## Acesso inicial
+
+Após o deploy:
+
+- URL: `https://seu-projeto.vercel.app`
+- Email: `admin@verdeazul.com`
+- Senha: `admin123`
+
+**Troque a senha imediatamente após o primeiro login!**
+
+---
+
+## Diferenças da versão anterior
+
+### O que mudou
+
+| Componente    | Antes (v1)            | Agora (v2)                          |
+|---------------|-----------------------|-------------------------------------|
+| Database      | `pg` (node-postgres)  | `@supabase/supabase-js`             |
+| File uploads  | Disco local (`/tmp`)  | Supabase Storage                    |
+| Rate limiting | Não havia             | 10 req/15min no `/api/auth/login`   |
+| CORS          | `*` (todos)           | Restrito via `ALLOWED_ORIGIN`       |
+| JWT secret    | Fallback hardcoded    | Obrigatório via env var             |
+| Env vars      | `DATABASE_URL`        | `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` |
+
+### Variáveis removidas
+- `DATABASE_URL` — não é mais necessário
+
+---
+
+## Desenvolvimento local
 
 ```bash
-cd verde-azul-gestao
 cp .env.example .env
-# Edite .env com sua DATABASE_URL do Supabase
+# Edite .env com suas credenciais Supabase
 npm install
-npm start
+npm run dev
 ```
-Acesse http://localhost:3000
 
----
-
-## Upload de fotos/contratos
-
-Em producao no Vercel, os arquivos enviados ficam em `/tmp` (temporarios).
-Para armazenamento permanente, integre com o **Supabase Storage**:
-1. Crie um bucket em Supabase -> Storage
-2. Adapte os endpoints de upload para usar `@supabase/storage-js`
-(Disponivel como melhoria futura)
-
----
-
-## Backup
-
-- Acesse **Configuracoes -> Backup** no sistema para baixar um JSON com todos os dados
-- O Supabase tambem oferece backup automatico diario (plano gratuito: 7 dias de retencao)
+O servidor inicia em `http://localhost:3000`.

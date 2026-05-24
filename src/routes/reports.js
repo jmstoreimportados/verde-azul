@@ -1,29 +1,48 @@
 const express = require('express');
-const { getDb } = require('../../database/db');
+const { supabase } = require('../../database/db');
 const { authenticate } = require('../middleware/auth');
 const router = express.Router();
 
-function getMonthRange(month, year) {
-  const m = String(month).padStart(2,'0');
-  return { like: `${year}-${m}-%` };
+const isProd = process.env.NODE_ENV === 'production';
+const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
+
+// Helper: month start/end as date strings
+function monthRange(year, month) {
+  const m = String(month).padStart(2, '0');
+  return { gte: `${year}-${m}-01`, lte: `${year}-${m}-31` };
 }
+
+// Helper: sum array of objects by field
+const sum = (arr, field) => (arr || []).reduce((s, r) => s + parseFloat(r[field] || 0), 0);
 
 // Receita por periodo (ultimos 6 meses)
 router.get('/revenue', authenticate, async (req, res) => {
   try {
-    const db = getDb();
+    const { data, error } = await supabase.rpc('get_revenue_by_month');
+    if (!error && data) return res.json(data);
+
+    // Fallback: compute month by month
     const months = [];
     for (let i = 5; i >= 0; i--) {
-      const d = new Date(); d.setMonth(d.getMonth() - i);
-      const m = String(d.getMonth()+1).padStart(2,'0');
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      const m = String(d.getMonth() + 1).padStart(2, '0');
       const y = d.getFullYear();
-      const r = await db.prepare(`SELECT COALESCE(SUM(value),0) as received FROM charges WHERE status='paid' AND due_date LIKE $1`).get(`${y}-${m}-%`);
-      const p = await db.prepare(`SELECT COALESCE(SUM(value),0) as pending FROM charges WHERE status IN ('pending','overdue') AND due_date LIKE $1`).get(`${y}-${m}-%`);
-      const e = await db.prepare(`SELECT COALESCE(SUM(value),0) as expenses FROM expenses WHERE date LIKE $1`).get(`${y}-${m}-%`);
-      months.push({ month: `${m}/${y}`, year: y, month_num: d.getMonth()+1, received: parseFloat(r.received), pending: parseFloat(p.pending), expenses: parseFloat(e.expenses), profit: parseFloat(r.received) - parseFloat(e.expenses) });
+      const { gte, lte } = monthRange(y, d.getMonth() + 1);
+
+      const [{ data: paid }, { data: pending }, { data: expenses }] = await Promise.all([
+        supabase.from('charges').select('value').eq('status', 'paid').gte('due_date', gte).lte('due_date', lte),
+        supabase.from('charges').select('value').in('status', ['pending', 'overdue']).gte('due_date', gte).lte('due_date', lte),
+        supabase.from('expenses').select('value').gte('date', gte).lte('date', lte)
+      ]);
+
+      const received = sum(paid, 'value');
+      const pend = sum(pending, 'value');
+      const exp = sum(expenses, 'value');
+      months.push({ month: `${m}/${y}`, year: y, month_num: d.getMonth() + 1, received, pending: pend, expenses: exp, profit: received - exp });
     }
     res.json(months);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // DRE - Receita vs Despesas
@@ -31,59 +50,138 @@ router.get('/profit', authenticate, async (req, res) => {
   try {
     const { month, year } = req.query;
     const now = new Date();
-    const m = month || now.getMonth()+1;
+    const m = month || now.getMonth() + 1;
     const y = year || now.getFullYear();
-    const { like } = getMonthRange(m, y);
-    const db = getDb();
+    const { gte, lte } = monthRange(y, m);
 
-    const received = await db.prepare(`SELECT COALESCE(SUM(value),0) as total FROM charges WHERE status='paid' AND due_date LIKE $1`).get(like);
-    const monthly_rev = await db.prepare(`SELECT COALESCE(SUM(value),0) as total FROM charges WHERE status='paid' AND type='monthly' AND due_date LIKE $1`).get(like);
-    const extra_rev = await db.prepare(`SELECT COALESCE(SUM(value),0) as total FROM charges WHERE status='paid' AND type='extra' AND due_date LIKE $1`).get(like);
-    const expenses = await db.prepare(`SELECT COALESCE(SUM(value),0) as total FROM expenses WHERE date LIKE $1`).get(like);
-    const expense_detail = await db.prepare(`SELECT category, COALESCE(SUM(value),0) as total FROM expenses WHERE date LIKE $1 GROUP BY category`).all(like);
-    const product_cost = await db.prepare(`SELECT COALESCE(SUM(sm.quantity * p.cost_price),0) as total FROM stock_movements sm JOIN products p ON sm.product_id = p.id WHERE sm.type='out' AND sm.reference_type='service' AND sm.created_at LIKE $1`).get(like);
+    const [
+      { data: paidCharges },
+      { data: monthlyPaid },
+      { data: extraPaid },
+      { data: expenseRows },
+      { data: expenseDetail },
+      { data: productCostRows }
+    ] = await Promise.all([
+      supabase.from('charges').select('value').eq('status', 'paid').gte('due_date', gte).lte('due_date', lte),
+      supabase.from('charges').select('value').eq('status', 'paid').eq('type', 'monthly').gte('due_date', gte).lte('due_date', lte),
+      supabase.from('charges').select('value').eq('status', 'paid').eq('type', 'extra').gte('due_date', gte).lte('due_date', lte),
+      supabase.from('expenses').select('value').gte('date', gte).lte('date', lte),
+      supabase.from('expenses').select('category, value').gte('date', gte).lte('date', lte),
+      // Product cost: sum(quantity * cost_price) for service outflows this month via RPC
+      supabase.rpc('get_product_cost_by_month', { month_start: gte, month_end: lte })
+    ]);
 
-    const rev = parseFloat(received.total);
-    const exp = parseFloat(expenses.total);
+    // Aggregate expense detail by category
+    const catMap = {};
+    for (const r of (expenseDetail || [])) {
+      catMap[r.category] = (catMap[r.category] || 0) + parseFloat(r.value);
+    }
+    const detail = Object.entries(catMap).map(([category, total]) => ({ category, total }));
+
+    const rev = sum(paidCharges, 'value');
+    const exp = sum(expenseRows, 'value');
+    const productCost = productCostRows?.[0]?.total || 0;
+
     res.json({
-      revenue: { total: rev, monthly: parseFloat(monthly_rev.total), extra: parseFloat(extra_rev.total) },
-      expenses: { total: exp, detail: expense_detail, product_cost: parseFloat(product_cost.total) },
+      revenue: { total: rev, monthly: sum(monthlyPaid, 'value'), extra: sum(extraPaid, 'value') },
+      expenses: { total: exp, detail, product_cost: parseFloat(productCost) },
       profit: rev - exp,
       margin: rev > 0 ? ((rev - exp) / rev * 100).toFixed(1) : 0
     });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Inadimplencia
 router.get('/overdue', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const overdue = await db.prepare(`SELECT ch.*, c.name as client_name, c.whatsapp, c.phone, EXTRACT(EPOCH FROM (CURRENT_DATE - ch.due_date::date))/86400 as days_overdue FROM charges ch JOIN clients c ON ch.client_id = c.id WHERE ch.status='overdue' ORDER BY days_overdue DESC`).all();
-    const total = overdue.reduce((s, c) => s + parseFloat(c.value), 0);
-    res.json({ charges: overdue, total, count: overdue.length });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data, error } = await supabase.rpc('get_overdue_with_days');
+    if (!error && data) {
+      const total = (data || []).reduce((s, c) => s + parseFloat(c.value), 0);
+      return res.json({ charges: data, total, count: data.length });
+    }
+
+    // Fallback: get overdue and compute days in JS
+    const { data: overdue, error: err2 } = await supabase
+      .from('charges')
+      .select('*, clients(name, whatsapp, phone)')
+      .eq('status', 'overdue')
+      .order('due_date');
+
+    if (err2) throw err2;
+    const today = new Date();
+    const formatted = (overdue || []).map(ch => {
+      const due = new Date(ch.due_date);
+      const days = Math.floor((today - due) / 86400000);
+      return {
+        ...ch,
+        client_name: ch.clients?.name,
+        whatsapp: ch.clients?.whatsapp,
+        phone: ch.clients?.phone,
+        clients: undefined,
+        days_overdue: days
+      };
+    }).sort((a, b) => b.days_overdue - a.days_overdue);
+
+    const total = formatted.reduce((s, c) => s + parseFloat(c.value), 0);
+    res.json({ charges: formatted, total, count: formatted.length });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Clientes mais rentaveis
 router.get('/top-clients', authenticate, async (req, res) => {
   try {
-    const { limit = 10 } = req.query;
-    const db = getDb();
-    const clients = await db.prepare(`SELECT c.id, c.name, c.phone, c.plan_type, COALESCE(SUM(ch.value),0) as total_billed, COUNT(DISTINCT ch.id) as charge_count, COUNT(DISTINCT s.id) as service_count FROM clients c LEFT JOIN charges ch ON ch.client_id = c.id AND ch.status = 'paid' LEFT JOIN services s ON s.client_id = c.id AND s.status = 'completed' WHERE c.status = 'active' GROUP BY c.id ORDER BY total_billed DESC LIMIT $1`).all(parseInt(limit));
-    res.json(clients);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const limit = parseInt(req.query.limit) || 10;
+    const { data, error } = await supabase.rpc('get_top_clients', { row_limit: limit });
+    if (!error && data) return res.json(data);
+
+    // Fallback: fetch and aggregate in JS
+    const { data: clients, error: err2 } = await supabase
+      .from('clients')
+      .select('id, name, phone, plan_type')
+      .eq('status', 'active');
+    if (err2) throw err2;
+
+    const results = [];
+    for (const c of (clients || [])) {
+      const [{ data: charges }, { count: svcCount }] = await Promise.all([
+        supabase.from('charges').select('value').eq('client_id', c.id).eq('status', 'paid'),
+        supabase.from('services').select('*', { count: 'exact', head: true }).eq('client_id', c.id).eq('status', 'completed')
+      ]);
+      results.push({
+        ...c,
+        total_billed: sum(charges, 'value'),
+        charge_count: (charges || []).length,
+        service_count: svcCount || 0
+      });
+    }
+    results.sort((a, b) => b.total_billed - a.total_billed);
+    res.json(results.slice(0, limit));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Receita por tipo de servico
 router.get('/revenue-by-type', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const monthly = await db.prepare(`SELECT COALESCE(SUM(value),0) as total FROM charges WHERE status='paid' AND type='monthly'`).get();
-    const extra = await db.prepare(`SELECT COALESCE(SUM(value),0) as total FROM charges WHERE status='paid' AND type='extra'`).get();
-    const pool = await db.prepare(`SELECT COALESCE(SUM(c.monthly_value),0) as total FROM clients c WHERE c.status='active' AND service_types::json->>0 = 'pool'`).get();
-    const garden = await db.prepare(`SELECT COALESCE(SUM(c.monthly_value),0) as total FROM clients c WHERE c.status='active' AND service_types::json->>0 = 'garden'`).get();
-    res.json({ monthly: parseFloat(monthly.total), extra: parseFloat(extra.total), pool_clients: parseFloat(pool.total), garden_clients: parseFloat(garden.total) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const [{ data: monthly }, { data: extra }, { data: allClients }] = await Promise.all([
+      supabase.from('charges').select('value').eq('status', 'paid').eq('type', 'monthly'),
+      supabase.from('charges').select('value').eq('status', 'paid').eq('type', 'extra'),
+      supabase.from('clients').select('monthly_value, service_types').eq('status', 'active')
+    ]);
+
+    let poolTotal = 0, gardenTotal = 0;
+    for (const c of (allClients || [])) {
+      const types = JSON.parse(c.service_types || '[]');
+      if (types[0] === 'pool') poolTotal += parseFloat(c.monthly_value || 0);
+      else if (types[0] === 'garden') gardenTotal += parseFloat(c.monthly_value || 0);
+    }
+
+    res.json({
+      monthly: sum(monthly, 'value'),
+      extra: sum(extra, 'value'),
+      pool_clients: poolTotal,
+      garden_clients: gardenTotal
+    });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Servicos realizados
@@ -91,65 +189,164 @@ router.get('/services-performed', authenticate, async (req, res) => {
   try {
     const { month, year } = req.query;
     const now = new Date();
-    const m = month || now.getMonth()+1;
+    const m = month || now.getMonth() + 1;
     const y = year || now.getFullYear();
-    const { like } = getMonthRange(m, y);
-    const db = getDb();
+    const { gte, lte } = monthRange(y, m);
 
-    const total = await db.prepare(`SELECT COUNT(*) as count FROM services WHERE status='completed' AND completed_date LIKE $1`).get(like);
-    const byType = await db.prepare(`SELECT service_category, COUNT(*) as count FROM services WHERE status='completed' AND completed_date LIKE $1 GROUP BY service_category`).all(like);
-    const byEmployee = await db.prepare(`SELECT e.name, COUNT(*) as count, ROUND(AVG(s.rating)::numeric,1) as avg_rating FROM services s LEFT JOIN employees e ON s.employee_id = e.id WHERE s.status='completed' AND s.completed_date LIKE $1 GROUP BY s.employee_id, e.name ORDER BY count DESC`).all(like);
-    const scheduled = await db.prepare(`SELECT COUNT(*) as count FROM services WHERE scheduled_date LIKE $1`).get(like);
-    const cancelled = await db.prepare(`SELECT COUNT(*) as count FROM services WHERE status='cancelled' AND scheduled_date LIKE $1`).get(like);
+    const [
+      { count: totalCompleted },
+      { data: byType },
+      { count: scheduled },
+      { count: cancelled },
+      { data: employeeServices }
+    ] = await Promise.all([
+      supabase.from('services').select('*', { count: 'exact', head: true }).eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte),
+      supabase.from('services').select('service_category').eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte),
+      supabase.from('services').select('*', { count: 'exact', head: true }).gte('scheduled_date', gte).lte('scheduled_date', lte),
+      supabase.from('services').select('*', { count: 'exact', head: true }).eq('status', 'cancelled').gte('scheduled_date', gte).lte('scheduled_date', lte),
+      supabase.from('services').select('employee_id, rating, employees(name)').eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte)
+    ]);
 
-    res.json({ total: parseInt(total.count), scheduled: parseInt(scheduled.count), cancelled: parseInt(cancelled.count), completion_rate: parseInt(scheduled.count) > 0 ? ((parseInt(total.count) / parseInt(scheduled.count))*100).toFixed(1) : 0, by_type: byType, by_employee: byEmployee });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    // Aggregate by type
+    const typeMap = {};
+    for (const s of (byType || [])) {
+      typeMap[s.service_category] = (typeMap[s.service_category] || 0) + 1;
+    }
+    const byTypeResult = Object.entries(typeMap).map(([service_category, count]) => ({ service_category, count }));
+
+    // Aggregate by employee
+    const empMap = {};
+    for (const s of (employeeServices || [])) {
+      const empId = s.employee_id;
+      const empName = s.employees?.name || 'Sem tecnico';
+      if (!empMap[empId]) empMap[empId] = { name: empName, count: 0, ratings: [] };
+      empMap[empId].count++;
+      if (s.rating) empMap[empId].ratings.push(s.rating);
+    }
+    const byEmployee = Object.values(empMap).map(e => ({
+      name: e.name,
+      count: e.count,
+      avg_rating: e.ratings.length > 0 ? parseFloat((e.ratings.reduce((a, b) => a + b, 0) / e.ratings.length).toFixed(1)) : null
+    })).sort((a, b) => b.count - a.count);
+
+    const total = totalCompleted || 0;
+    const sched = scheduled || 0;
+    res.json({
+      total, scheduled: sched, cancelled: cancelled || 0,
+      completion_rate: sched > 0 ? ((total / sched) * 100).toFixed(1) : 0,
+      by_type: byTypeResult,
+      by_employee: byEmployee
+    });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Satisfacao geral
 router.get('/satisfaction', authenticate, async (req, res) => {
   try {
-    const db = getDb();
     const months = [];
     for (let i = 5; i >= 0; i--) {
-      const d = new Date(); d.setMonth(d.getMonth() - i);
-      const m = String(d.getMonth()+1).padStart(2,'0');
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      const m = String(d.getMonth() + 1).padStart(2, '0');
       const y = d.getFullYear();
-      const r = await db.prepare(`SELECT ROUND(AVG(rating)::numeric,1) as avg, COUNT(*) as count FROM services WHERE rating IS NOT NULL AND completed_date LIKE $1`).get(`${y}-${m}-%`);
-      months.push({ month: `${m}/${y}`, avg: r.avg, count: parseInt(r.count) });
+      const { gte, lte } = monthRange(y, d.getMonth() + 1);
+
+      const { data: ratingData } = await supabase
+        .from('services')
+        .select('rating')
+        .not('rating', 'is', null)
+        .gte('completed_date', gte).lte('completed_date', lte);
+
+      const ratings = (ratingData || []).map(r => r.rating);
+      const avg = ratings.length > 0
+        ? parseFloat((ratings.reduce((a, b) => a + b, 0) / ratings.length).toFixed(1))
+        : null;
+      months.push({ month: `${m}/${y}`, avg, count: ratings.length });
     }
-    const dist = await db.prepare(`SELECT rating, COUNT(*) as count FROM services WHERE rating IS NOT NULL GROUP BY rating ORDER BY rating`).all();
-    const overall = await db.prepare(`SELECT ROUND(AVG(rating)::numeric,1) as avg, COUNT(*) as count FROM services WHERE rating IS NOT NULL`).get();
-    res.json({ monthly: months, distribution: dist, overall });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const { data: allRatings } = await supabase
+      .from('services')
+      .select('rating')
+      .not('rating', 'is', null);
+
+    // Distribution
+    const distMap = {};
+    for (const r of (allRatings || [])) {
+      distMap[r.rating] = (distMap[r.rating] || 0) + 1;
+    }
+    const distribution = Object.entries(distMap)
+      .map(([rating, count]) => ({ rating: parseInt(rating), count }))
+      .sort((a, b) => a.rating - b.rating);
+
+    const allR = (allRatings || []).map(r => r.rating);
+    const overallAvg = allR.length > 0
+      ? parseFloat((allR.reduce((a, b) => a + b, 0) / allR.length).toFixed(1))
+      : null;
+
+    res.json({ monthly: months, distribution, overall: { avg: overallAvg, count: allR.length } });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Clientes em risco
 router.get('/at-risk', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 90);
+    const { data, error } = await supabase.rpc('get_at_risk_clients');
+    if (!error && data) return res.json(data);
+
+    // Fallback: compute in JS
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 90);
     const cutoffStr = cutoff.toISOString().split('T')[0];
-    const clients = await db.prepare(`SELECT c.id, c.name, c.phone, c.whatsapp, COALESCE(AVG(s.rating),0) as avg_rating, COUNT(CASE WHEN ch.status='overdue' THEN 1 END) as overdue_count, COALESCE(SUM(CASE WHEN ch.status='overdue' THEN ch.value END),0) as overdue_amount FROM clients c LEFT JOIN services s ON s.client_id = c.id AND s.rating IS NOT NULL AND s.completed_date >= $1 LEFT JOIN charges ch ON ch.client_id = c.id WHERE c.status = 'active' GROUP BY c.id HAVING (AVG(s.rating) > 0 AND AVG(s.rating) <= 2.5) OR COUNT(CASE WHEN ch.status='overdue' THEN 1 END) > 0 ORDER BY overdue_amount DESC, avg_rating ASC`).all(cutoffStr);
-    res.json(clients);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const { data: clients, error: err2 } = await supabase
+      .from('clients')
+      .select('id, name, phone, whatsapp')
+      .eq('status', 'active');
+    if (err2) throw err2;
+
+    const results = [];
+    for (const c of (clients || [])) {
+      const [{ data: ratings }, { data: overdueCharges }] = await Promise.all([
+        supabase.from('services').select('rating').eq('client_id', c.id).not('rating', 'is', null).gte('completed_date', cutoffStr),
+        supabase.from('charges').select('value').eq('client_id', c.id).eq('status', 'overdue')
+      ]);
+
+      const ratingValues = (ratings || []).map(r => r.rating);
+      const avgRating = ratingValues.length > 0
+        ? ratingValues.reduce((a, b) => a + b, 0) / ratingValues.length
+        : 0;
+      const overdueAmount = sum(overdueCharges, 'value');
+      const overdueCount = (overdueCharges || []).length;
+
+      if ((avgRating > 0 && avgRating <= 2.5) || overdueCount > 0) {
+        results.push({ ...c, avg_rating: avgRating, overdue_count: overdueCount, overdue_amount: overdueAmount });
+      }
+    }
+    results.sort((a, b) => b.overdue_amount - a.overdue_amount || a.avg_rating - b.avg_rating);
+    res.json(results);
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Crescimento da base
 router.get('/client-growth', authenticate, async (req, res) => {
   try {
-    const db = getDb();
     const months = [];
     for (let i = 5; i >= 0; i--) {
-      const d = new Date(); d.setMonth(d.getMonth() - i);
-      const m = String(d.getMonth()+1).padStart(2,'0');
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      const m = String(d.getMonth() + 1).padStart(2, '0');
       const y = d.getFullYear();
-      const newClients = await db.prepare(`SELECT COUNT(*) as count FROM clients WHERE created_at LIKE $1`).get(`${y}-${m}-%`);
-      const active = await db.prepare(`SELECT COUNT(*) as count FROM clients WHERE status='active' AND created_at <= $1`).get(`${y}-${m}-31`);
-      months.push({ month: `${m}/${y}`, new_clients: parseInt(newClients.count), active_total: parseInt(active.count) });
+      const { gte, lte } = monthRange(y, d.getMonth() + 1);
+
+      const [{ count: newClients }, { count: activeTotal }] = await Promise.all([
+        supabase.from('clients').select('*', { count: 'exact', head: true }).gte('created_at', gte).lte('created_at', lte),
+        supabase.from('clients').select('*', { count: 'exact', head: true }).eq('status', 'active').lte('created_at', lte)
+      ]);
+
+      months.push({ month: `${m}/${y}`, new_clients: newClients || 0, active_total: activeTotal || 0 });
     }
     res.json(months);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Produtividade da equipe
@@ -157,48 +354,113 @@ router.get('/team-productivity', authenticate, async (req, res) => {
   try {
     const { month, year } = req.query;
     const now = new Date();
-    const m = month || now.getMonth()+1;
+    const m = month || now.getMonth() + 1;
     const y = year || now.getFullYear();
-    const { like } = getMonthRange(m, y);
-    const db = getDb();
-    const employees = await db.prepare(`SELECT e.id, e.name, e.function, COUNT(s.id) as services_completed, ROUND(AVG(s.rating)::numeric,1) as avg_rating, COUNT(CASE WHEN s.service_category='pool' THEN 1 END) as pool_count, COUNT(CASE WHEN s.service_category='garden' THEN 1 END) as garden_count FROM employees e LEFT JOIN services s ON s.employee_id = e.id AND s.status='completed' AND s.completed_date LIKE $1 WHERE e.status='active' GROUP BY e.id ORDER BY services_completed DESC`).all(like);
-    res.json(employees);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { gte, lte } = monthRange(y, m);
+
+    const { data: employees, error } = await supabase
+      .from('employees')
+      .select('id, name, function')
+      .eq('status', 'active');
+    if (error) throw error;
+
+    const results = [];
+    for (const e of (employees || [])) {
+      const { data: svcs } = await supabase
+        .from('services')
+        .select('rating, service_category')
+        .eq('employee_id', e.id)
+        .eq('status', 'completed')
+        .gte('completed_date', gte)
+        .lte('completed_date', lte);
+
+      const ratings = (svcs || []).map(s => s.rating).filter(r => r !== null);
+      const avgRating = ratings.length > 0
+        ? parseFloat((ratings.reduce((a, b) => a + b, 0) / ratings.length).toFixed(1))
+        : null;
+
+      results.push({
+        id: e.id,
+        name: e.name,
+        function: e.function,
+        services_completed: (svcs || []).length,
+        avg_rating: avgRating,
+        pool_count: (svcs || []).filter(s => s.service_category === 'pool').length,
+        garden_count: (svcs || []).filter(s => s.service_category === 'garden').length
+      });
+    }
+    results.sort((a, b) => b.services_completed - a.services_completed);
+    res.json(results);
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Qualidade da agua por cliente
 router.get('/water-quality/:clientId', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const services = await db.prepare(`SELECT scheduled_date, completed_date, water_quality FROM services WHERE client_id = $1 AND status='completed' AND water_quality != '{}' ORDER BY completed_date DESC LIMIT 20`).all(req.params.clientId);
-    const result = services.map(s => ({ date: s.completed_date || s.scheduled_date, ...JSON.parse(s.water_quality || '{}') }));
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data, error } = await supabase
+      .from('services')
+      .select('scheduled_date, completed_date, water_quality')
+      .eq('client_id', req.params.clientId)
+      .eq('status', 'completed')
+      .neq('water_quality', '{}')
+      .order('completed_date', { ascending: false })
+      .limit(20);
+
+    if (error) throw error;
+    res.json((data || []).map(s => ({
+      date: s.completed_date || s.scheduled_date,
+      ...JSON.parse(s.water_quality || '{}')
+    })));
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Piscinas fora do padrao
 router.get('/water-quality-alerts', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const settingRow = await db.prepare(`SELECT value FROM settings WHERE key='water_quality_params'`).get();
+    const { data: settingRow } = await supabase
+      .from('settings')
+      .select('value')
+      .eq('key', 'water_quality_params')
+      .maybeSingle();
+
     const params = JSON.parse(settingRow?.value || '{}');
-    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 7);
-    const recent = await db.prepare(`SELECT s.id, s.water_quality, s.completed_date, c.name as client_name, c.whatsapp FROM services s JOIN clients c ON s.client_id = c.id WHERE s.status='completed' AND s.water_quality != '{}' AND s.completed_date >= $1`).all(cutoff.toISOString().split('T')[0]);
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 7);
+    const cutoffStr = cutoff.toISOString().split('T')[0];
+
+    const { data: recent, error } = await supabase
+      .from('services')
+      .select('id, water_quality, completed_date, clients(name, whatsapp)')
+      .eq('status', 'completed')
+      .neq('water_quality', '{}')
+      .gte('completed_date', cutoffStr);
+
+    if (error) throw error;
 
     const alerts = [];
-    for (const svc of recent) {
+    for (const svc of (recent || [])) {
       const wq = JSON.parse(svc.water_quality || '{}');
       const issues = [];
       for (const [key, config] of Object.entries(params)) {
         const val = wq[key];
         if (val !== undefined && val !== null) {
-          if (val < config.min || val > config.max) issues.push(`${config.label}: ${val} (ideal: ${config.min}-${config.max})`);
+          if (val < config.min || val > config.max) {
+            issues.push(`${config.label}: ${val} (ideal: ${config.min}-${config.max})`);
+          }
         }
       }
-      if (issues.length > 0) alerts.push({ ...svc, issues });
+      if (issues.length > 0) {
+        alerts.push({
+          id: svc.id,
+          completed_date: svc.completed_date,
+          client_name: svc.clients?.name,
+          whatsapp: svc.clients?.whatsapp,
+          issues
+        });
+      }
     }
     res.json(alerts);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Consumo de produtos
@@ -206,51 +468,114 @@ router.get('/product-consumption', authenticate, async (req, res) => {
   try {
     const { month, year } = req.query;
     const now = new Date();
-    const m = month || now.getMonth()+1;
+    const m = month || now.getMonth() + 1;
     const y = year || now.getFullYear();
-    const { like } = getMonthRange(m, y);
-    const db = getDb();
-    const consumption = await db.prepare(`SELECT p.name, p.unit, p.cost_price, COALESCE(SUM(sm.quantity),0) as total_used, COALESCE(SUM(sm.quantity * p.cost_price),0) as total_cost FROM stock_movements sm JOIN products p ON sm.product_id = p.id WHERE sm.type='out' AND sm.reference_type='service' AND sm.created_at LIKE $1 GROUP BY p.id, p.name, p.unit, p.cost_price ORDER BY total_cost DESC`).all(like);
-    const totalCost = consumption.reduce((s, c) => s + parseFloat(c.total_cost), 0);
+    const { gte, lte } = monthRange(y, m);
+
+    const { data, error } = await supabase.rpc('get_product_consumption', { month_start: gte, month_end: lte });
+    if (!error && data) {
+      const totalCost = (data || []).reduce((s, c) => s + parseFloat(c.total_cost || 0), 0);
+      return res.json({ items: data, total_cost: totalCost });
+    }
+
+    // Fallback: aggregate in JS
+    const { data: movements, error: err2 } = await supabase
+      .from('stock_movements')
+      .select('product_id, quantity, products(name, unit, cost_price)')
+      .eq('type', 'out')
+      .eq('reference_type', 'service')
+      .gte('created_at', gte)
+      .lte('created_at', lte);
+
+    if (err2) throw err2;
+
+    const prodMap = {};
+    for (const mv of (movements || [])) {
+      const id = mv.product_id;
+      if (!prodMap[id]) {
+        prodMap[id] = {
+          name: mv.products?.name,
+          unit: mv.products?.unit,
+          cost_price: parseFloat(mv.products?.cost_price || 0),
+          total_used: 0,
+          total_cost: 0
+        };
+      }
+      prodMap[id].total_used += parseFloat(mv.quantity);
+      prodMap[id].total_cost += parseFloat(mv.quantity) * prodMap[id].cost_price;
+    }
+
+    const consumption = Object.values(prodMap).sort((a, b) => b.total_cost - a.total_cost);
+    const totalCost = consumption.reduce((s, c) => s + c.total_cost, 0);
     res.json({ items: consumption, total_cost: totalCost });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Estoque atual
 router.get('/stock', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const products = await db.prepare(`SELECT p.*, (p.stock_quantity * p.cost_price) as stock_value, (p.stock_quantity <= p.min_stock) as is_low FROM products p WHERE p.status='active' ORDER BY is_low DESC, p.category, p.name`).all();
-    const totalValue = products.reduce((s, p) => s + parseFloat(p.stock_value), 0);
+    const { data, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('status', 'active')
+      .order('category')
+      .order('name');
+
+    if (error) throw error;
+
+    const products = (data || []).map(p => ({
+      ...p,
+      stock_value: parseFloat(p.stock_quantity) * parseFloat(p.cost_price),
+      is_low: p.stock_quantity <= p.min_stock
+    })).sort((a, b) => b.is_low - a.is_low);
+
+    const totalValue = products.reduce((s, p) => s + p.stock_value, 0);
     const lowCount = products.filter(p => p.is_low).length;
     res.json({ products, total_value: totalValue, low_stock_count: lowCount });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 // Historico completo do cliente
 router.get('/client-history/:clientId', authenticate, async (req, res) => {
   try {
-    const db = getDb();
-    const client = await db.prepare('SELECT * FROM clients WHERE id = $1').get(req.params.clientId);
-    if (!client) return res.status(404).json({ error: 'Cliente nao encontrado' });
+    const { data: client, error } = await supabase
+      .from('clients')
+      .select('*')
+      .eq('id', req.params.clientId)
+      .single();
+
+    if (error || !client) return res.status(404).json({ error: 'Cliente nao encontrado' });
     client.service_types = JSON.parse(client.service_types || '[]');
 
-    const services = await db.prepare(`SELECT s.*, e.name as employee_name FROM services s LEFT JOIN employees e ON s.employee_id = e.id WHERE s.client_id = $1 ORDER BY s.scheduled_date DESC`).all(client.id);
-    services.forEach(s => {
-      s.checklist = JSON.parse(s.checklist || '[]');
-      s.water_quality = JSON.parse(s.water_quality || '{}');
-      s.products_used = JSON.parse(s.products_used || '[]');
-      s.photos = JSON.parse(s.photos || '[]');
-    });
+    const [{ data: services }, { data: charges }] = await Promise.all([
+      supabase.from('services').select('*, employees(name)').eq('client_id', client.id).order('scheduled_date', { ascending: false }),
+      supabase.from('charges').select('*').eq('client_id', client.id).order('due_date', { ascending: false })
+    ]);
 
-    const charges = await db.prepare('SELECT * FROM charges WHERE client_id = $1 ORDER BY due_date DESC').all(client.id);
-    const totalPaid = charges.filter(c => c.status === 'paid').reduce((s, c) => s + parseFloat(c.value), 0);
-    const totalOverdue = charges.filter(c => c.status === 'overdue').reduce((s, c) => s + parseFloat(c.value), 0);
-    const rated = services.filter(s => s.rating);
+    const servicesFormatted = (services || []).map(s => ({
+      ...s,
+      employee_name: s.employees?.name,
+      employees: undefined,
+      checklist: JSON.parse(s.checklist || '[]'),
+      water_quality: JSON.parse(s.water_quality || '{}'),
+      products_used: JSON.parse(s.products_used || '[]'),
+      photos: JSON.parse(s.photos || '[]')
+    }));
+
+    const totalPaid = (charges || []).filter(c => c.status === 'paid').reduce((s, c) => s + parseFloat(c.value), 0);
+    const totalOverdue = (charges || []).filter(c => c.status === 'overdue').reduce((s, c) => s + parseFloat(c.value), 0);
+    const rated = servicesFormatted.filter(s => s.rating);
     const avgRating = rated.length > 0 ? rated.reduce((s, c) => s + c.rating, 0) / rated.length : null;
 
-    res.json({ client, services, charges, stats: { total_services: services.length, completed_services: services.filter(s => s.status === 'completed').length, total_paid: totalPaid, total_overdue: totalOverdue, avg_rating: avgRating } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({
+      client, services: servicesFormatted, charges: charges || [],
+      stats: {
+        total_services: servicesFormatted.length,
+        completed_services: servicesFormatted.filter(s => s.status === 'completed').length,
+        total_paid: totalPaid, total_overdue: totalOverdue, avg_rating: avgRating
+      }
+    });
+  } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
 module.exports = router;
