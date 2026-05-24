@@ -11,17 +11,16 @@ const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
 // Memory storage — uploads go to Supabase Storage
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
-function parseService(s) {
+function parseService(s, clientMap, empMap) {
+  const client = clientMap[s.client_id] || {};
   return {
     ...s,
-    employee_name: s.employees?.name || null,
-    employees: undefined,
-    client_name: s.clients?.name || null,
-    address: s.clients?.address || null,
-    neighborhood: s.clients?.neighborhood || null,
-    city: s.clients?.city || null,
-    client_whatsapp: s.clients?.whatsapp || null,
-    clients: undefined,
+    employee_name: empMap[s.employee_id] || null,
+    client_name: client.name || null,
+    address: client.address || null,
+    neighborhood: client.neighborhood || null,
+    city: client.city || null,
+    client_whatsapp: client.whatsapp || null,
     checklist: JSON.parse(s.checklist || '[]'),
     water_quality: JSON.parse(s.water_quality || '{}'),
     products_used: JSON.parse(s.products_used || '[]'),
@@ -35,7 +34,7 @@ router.get('/today', authenticate, async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     let query = supabase
       .from('services')
-      .select('*, clients(name, address, neighborhood, city, whatsapp), employees(name)')
+      .select('*')
       .eq('scheduled_date', today)
       .neq('status', 'cancelled')
       .order('scheduled_date');
@@ -52,7 +51,19 @@ router.get('/today', authenticate, async (req, res) => {
 
     const { data, error } = await query;
     if (error) throw error;
-    res.json((data || []).map(parseService));
+
+    const clientIds = [...new Set((data || []).map(r => r.client_id).filter(Boolean))];
+    const empIds = [...new Set((data || []).map(r => r.employee_id).filter(Boolean))];
+
+    const [{ data: clients }, { data: emps }] = await Promise.all([
+      clientIds.length ? supabase.from('clients').select('id, name, address, neighborhood, city, whatsapp').in('id', clientIds) : Promise.resolve({ data: [] }),
+      empIds.length ? supabase.from('employees').select('id, name').in('id', empIds) : Promise.resolve({ data: [] })
+    ]);
+
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
+    const empMap = Object.fromEntries((emps || []).map(e => [e.id, e.name]));
+
+    res.json((data || []).map(s => parseService(s, clientMap, empMap)));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
@@ -63,7 +74,7 @@ router.get('/', authenticate, async (req, res) => {
 
     let query = supabase
       .from('services')
-      .select('*, clients(name, address, neighborhood, whatsapp), employees(name)')
+      .select('*')
       .order('scheduled_date')
       .order('client_id');
 
@@ -81,7 +92,19 @@ router.get('/', authenticate, async (req, res) => {
 
     const { data, error } = await query;
     if (error) throw error;
-    res.json((data || []).map(parseService));
+
+    const clientIds = [...new Set((data || []).map(r => r.client_id).filter(Boolean))];
+    const empIds = [...new Set((data || []).map(r => r.employee_id).filter(Boolean))];
+
+    const [{ data: clients }, { data: emps }] = await Promise.all([
+      clientIds.length ? supabase.from('clients').select('id, name, address, neighborhood, whatsapp').in('id', clientIds) : Promise.resolve({ data: [] }),
+      empIds.length ? supabase.from('employees').select('id, name').in('id', empIds) : Promise.resolve({ data: [] })
+    ]);
+
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
+    const empMap = Object.fromEntries((emps || []).map(e => [e.id, e.name]));
+
+    res.json((data || []).map(s => parseService(s, clientMap, empMap)));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
 
@@ -127,11 +150,17 @@ router.post('/:id/notify-arrival', authenticate, async (req, res) => {
 
     const { data: svc, error } = await supabase
       .from('services')
-      .select('*, clients(name, whatsapp), employees(name)')
+      .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (error || !svc) return res.status(404).json({ error: 'Servico nao encontrado' });
+
+    // Lookup client and employee separately
+    const [{ data: clientData }, { data: empData }] = await Promise.all([
+      svc.client_id ? supabase.from('clients').select('id, name, whatsapp').eq('id', svc.client_id).maybeSingle() : Promise.resolve({ data: null }),
+      svc.employee_id ? supabase.from('employees').select('id, name').eq('id', svc.employee_id).maybeSingle() : Promise.resolve({ data: null })
+    ]);
 
     const { data: settingsRows } = await supabase.from('settings').select('key, value');
     const settings = {};
@@ -139,11 +168,11 @@ router.post('/:id/notify-arrival', authenticate, async (req, res) => {
 
     const catLabel = svc.service_category === 'pool' ? 'piscina' : svc.service_category === 'garden' ? 'jardim' : 'manutencao';
     const msg = (settings.whatsapp_template_arrival || 'Ola {nome}! Nosso tecnico {tecnico} esta a caminho para o servico de {servico}.')
-      .replace('{nome}', svc.clients?.name || '')
-      .replace('{tecnico}', svc.employees?.name || 'nosso tecnico')
+      .replace('{nome}', clientData?.name || '')
+      .replace('{tecnico}', empData?.name || 'nosso tecnico')
       .replace('{servico}', catLabel);
 
-    const whatsapp = svc.clients?.whatsapp?.replace(/\D/g, '');
+    const whatsapp = clientData?.whatsapp?.replace(/\D/g, '');
     const waLink = `https://wa.me/55${whatsapp}?text=${encodeURIComponent(msg)}`;
     await supabase.from('message_log').insert({ client_id: svc.client_id, type: 'arrival', message: msg });
     res.json({ wa_link: waLink, message: msg });
@@ -158,11 +187,16 @@ router.post('/:id/complete', authenticate, async (req, res) => {
 
     const { data: svc, error: fetchErr } = await supabase
       .from('services')
-      .select('*, clients(name, whatsapp, plan_type, monthly_value)')
+      .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (fetchErr || !svc) return res.status(404).json({ error: 'Servico nao encontrado' });
+
+    // Lookup client separately
+    const { data: clientData } = svc.client_id
+      ? await supabase.from('clients').select('id, name, whatsapp, plan_type, monthly_value').eq('id', svc.client_id).maybeSingle()
+      : { data: null };
 
     await supabase
       .from('services')
@@ -182,7 +216,7 @@ router.post('/:id/complete', authenticate, async (req, res) => {
           .from('products')
           .select('stock_quantity')
           .eq('id', pu.product_id)
-          .single();
+          .maybeSingle();
 
         if (prod) {
           await supabase.from('products')
@@ -231,14 +265,14 @@ router.post('/:id/complete', authenticate, async (req, res) => {
     const catLabel = svc.service_category === 'pool' ? 'Piscina' : svc.service_category === 'garden' ? 'Jardim' : 'Manutencao';
 
     let reportMsg = (settings.whatsapp_template_report || '')
-      .replace('{nome}', svc.clients?.name || '')
+      .replace('{nome}', clientData?.name || '')
       .replace('{servico}', catLabel)
       .replace('{data}', new Date(today).toLocaleDateString('pt-BR'))
       .replace('{checklist}', checklistText)
       .replace('{produtos}', productsText)
       .replace('{proxima_visita}', nextDate);
 
-    const whatsapp = svc.clients?.whatsapp?.replace(/\D/g, '');
+    const whatsapp = clientData?.whatsapp?.replace(/\D/g, '');
     const waLink = reportMsg && whatsapp ? `https://wa.me/55${whatsapp}?text=${encodeURIComponent(reportMsg)}` : null;
 
     await supabase.from('services').update({ report_sent: 1 }).eq('id', req.params.id);
@@ -255,7 +289,7 @@ router.post('/:id/photos', authenticate, upload.array('photos', 5), async (req, 
       .from('services')
       .select('photos')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (fetchErr) throw fetchErr;
     const existingPhotos = JSON.parse(svc?.photos || '[]');

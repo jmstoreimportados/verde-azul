@@ -60,7 +60,7 @@ router.post('/:id/convert', authenticate, async (req, res) => {
       .from('budgets')
       .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (fetchErr || !budget) return res.status(404).json({ error: 'Orcamento nao encontrado' });
 
@@ -96,7 +96,7 @@ router.get('/:id/whatsapp', authenticate, async (req, res) => {
       .from('budgets')
       .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (error || !budget) return res.status(404).json({ error: 'Nao encontrado' });
 

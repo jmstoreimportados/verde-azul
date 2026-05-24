@@ -71,7 +71,7 @@ router.get('/:id/schedule', authenticate, async (req, res) => {
     const { month, year } = req.query;
     let query = supabase
       .from('services')
-      .select('*, clients(name, address, neighborhood)')
+      .select('*')
       .eq('employee_id', req.params.id)
       .neq('status', 'cancelled')
       .order('scheduled_date');
@@ -85,12 +85,18 @@ router.get('/:id/schedule', authenticate, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
 
+    // Lookup clients separately
+    const clientIds = [...new Set((data || []).map(s => s.client_id).filter(Boolean))];
+    const { data: clients } = clientIds.length
+      ? await supabase.from('clients').select('id, name, address, neighborhood').in('id', clientIds)
+      : { data: [] };
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
+
     res.json((data || []).map(s => ({
       ...s,
-      client_name: s.clients?.name,
-      address: s.clients?.address,
-      neighborhood: s.clients?.neighborhood,
-      clients: undefined
+      client_name: clientMap[s.client_id]?.name || null,
+      address: clientMap[s.client_id]?.address || null,
+      neighborhood: clientMap[s.client_id]?.neighborhood || null
     })));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });

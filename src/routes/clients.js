@@ -18,7 +18,7 @@ router.get('/', authenticate, async (req, res) => {
 
     let query = supabase
       .from('clients')
-      .select('*, employees(name)')
+      .select('*')
       .order('name');
 
     if (status) query = query.eq('status', status);
@@ -29,10 +29,16 @@ router.get('/', authenticate, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
 
+    // Gather unique employee IDs
+    const empIds = [...new Set((data || []).map(r => r.responsible_employee_id).filter(Boolean))];
+    const { data: emps } = empIds.length
+      ? await supabase.from('employees').select('id, name').in('id', empIds)
+      : { data: [] };
+    const empMap = Object.fromEntries((emps || []).map(e => [e.id, e.name]));
+
     // Get overdue status for each client
     for (const c of data) {
-      c.employee_name = c.employees?.name || null;
-      delete c.employees;
+      c.employee_name = empMap[c.responsible_employee_id] || null;
       c.service_types = JSON.parse(c.service_types || '[]');
 
       const { count } = await supabase
@@ -52,14 +58,23 @@ router.get('/:id', authenticate, async (req, res) => {
   try {
     const { data: client, error } = await supabase
       .from('clients')
-      .select('*, employees(name)')
+      .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (error || !client) return res.status(404).json({ error: 'Cliente nao encontrado' });
 
-    client.employee_name = client.employees?.name || null;
-    delete client.employees;
+    // Lookup responsible employee
+    if (client.responsible_employee_id) {
+      const { data: emp } = await supabase
+        .from('employees')
+        .select('id, name')
+        .eq('id', client.responsible_employee_id)
+        .maybeSingle();
+      client.employee_name = emp?.name || null;
+    } else {
+      client.employee_name = null;
+    }
     client.service_types = JSON.parse(client.service_types || '[]');
 
     const { data: charges } = await supabase
@@ -69,33 +84,45 @@ router.get('/:id', authenticate, async (req, res) => {
       .order('due_date', { ascending: false })
       .limit(20);
 
-    const { data: services } = await supabase
+    // Fetch services separately, then lookup employees
+    const { data: servicesRaw } = await supabase
       .from('services')
-      .select('*, employees(name)')
+      .select('*')
       .eq('client_id', client.id)
       .order('scheduled_date', { ascending: false })
       .limit(30);
 
-    const { data: kit } = await supabase
+    const svcEmpIds = [...new Set((servicesRaw || []).map(s => s.employee_id).filter(Boolean))];
+    const { data: svcEmps } = svcEmpIds.length
+      ? await supabase.from('employees').select('id, name').in('id', svcEmpIds)
+      : { data: [] };
+    const svcEmpMap = Object.fromEntries((svcEmps || []).map(e => [e.id, e.name]));
+
+    // Fetch kit separately, then lookup products
+    const { data: kitRaw } = await supabase
       .from('client_kits')
-      .select('*, products(name, unit)')
+      .select('*')
       .eq('client_id', client.id);
 
-    const servicesFormatted = (services || []).map(s => ({
+    const productIds = [...new Set((kitRaw || []).map(k => k.product_id).filter(Boolean))];
+    const { data: products } = productIds.length
+      ? await supabase.from('products').select('id, name, unit').in('id', productIds)
+      : { data: [] };
+    const productMap = Object.fromEntries((products || []).map(p => [p.id, p]));
+
+    const servicesFormatted = (servicesRaw || []).map(s => ({
       ...s,
-      employee_name: s.employees?.name || null,
-      employees: undefined,
+      employee_name: svcEmpMap[s.employee_id] || null,
       checklist: JSON.parse(s.checklist || '[]'),
       water_quality: JSON.parse(s.water_quality || '{}'),
       products_used: JSON.parse(s.products_used || '[]'),
       photos: JSON.parse(s.photos || '[]')
     }));
 
-    const kitFormatted = (kit || []).map(k => ({
+    const kitFormatted = (kitRaw || []).map(k => ({
       ...k,
-      product_name: k.products?.name,
-      unit: k.products?.unit,
-      products: undefined
+      product_name: productMap[k.product_id]?.name || null,
+      unit: productMap[k.product_id]?.unit || null
     }));
 
     res.json({ ...client, charges: charges || [], services: servicesFormatted, kit: kitFormatted });
@@ -237,7 +264,7 @@ router.get('/:id/contract/generate', authenticate, async (req, res) => {
       .from('clients')
       .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (error || !client) return res.status(404).json({ error: 'Cliente nao encontrado' });
     client.service_types = JSON.parse(client.service_types || '[]');

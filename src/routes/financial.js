@@ -7,9 +7,6 @@ const router = express.Router();
 const isProd = process.env.NODE_ENV === 'production';
 const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
 
-// Helper: build date range filter for Supabase using gte/lte on date prefix
-// Supabase doesn't support LIKE on text, but dates are stored as text YYYY-MM-DD
-// We can use gte/lte for ranges, and for month we use gte(YYYY-MM-01) lte(YYYY-MM-31)
 function monthRange(year, month) {
   const m = String(month).padStart(2, '0');
   return { gte: `${year}-${m}-01`, lte: `${year}-${m}-31` };
@@ -23,7 +20,7 @@ router.get('/charges', authenticate, async (req, res) => {
 
     let query = supabase
       .from('charges')
-      .select('*, clients(name, whatsapp)')
+      .select('*')
       .order('due_date', { ascending: false });
 
     if (status) query = query.eq('status', status);
@@ -41,11 +38,17 @@ router.get('/charges', authenticate, async (req, res) => {
     const { data, error } = await query;
     if (error) throw error;
 
+    // Lookup clients separately
+    const clientIds = [...new Set((data || []).map(r => r.client_id).filter(Boolean))];
+    const { data: clients } = clientIds.length
+      ? await supabase.from('clients').select('id, name, whatsapp').in('id', clientIds)
+      : { data: [] };
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
+
     res.json((data || []).map(ch => ({
       ...ch,
-      client_name: ch.clients?.name,
-      whatsapp: ch.clients?.whatsapp,
-      clients: undefined
+      client_name: clientMap[ch.client_id]?.name || null,
+      whatsapp: clientMap[ch.client_id]?.whatsapp || null
     })));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });
@@ -145,28 +148,26 @@ router.get('/alerts', authenticate, async (req, res) => {
     in3days.setDate(in3days.getDate() + 3);
     const in3str = in3days.toISOString().split('T')[0];
 
-    const { data: dueIn3, error: e1 } = await supabase
-      .from('charges')
-      .select('*, clients(name, whatsapp)')
-      .eq('status', 'pending')
-      .gte('due_date', today)
-      .lte('due_date', in3str)
-      .order('due_date');
-
-    const { data: overdueList, error: e2 } = await supabase
-      .from('charges')
-      .select('*, clients(name, whatsapp)')
-      .eq('status', 'overdue')
-      .order('due_date');
+    const [{ data: dueIn3, error: e1 }, { data: overdueList, error: e2 }] = await Promise.all([
+      supabase.from('charges').select('*').eq('status', 'pending').gte('due_date', today).lte('due_date', in3str).order('due_date'),
+      supabase.from('charges').select('*').eq('status', 'overdue').order('due_date')
+    ]);
 
     if (e1) throw e1;
     if (e2) throw e2;
 
+    // Gather all client IDs and lookup in one query
+    const allCharges = [...(dueIn3 || []), ...(overdueList || [])];
+    const clientIds = [...new Set(allCharges.map(ch => ch.client_id).filter(Boolean))];
+    const { data: clients } = clientIds.length
+      ? await supabase.from('clients').select('id, name, whatsapp').in('id', clientIds)
+      : { data: [] };
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
+
     const flatten = (arr) => (arr || []).map(ch => ({
       ...ch,
-      client_name: ch.clients?.name,
-      whatsapp: ch.clients?.whatsapp,
-      clients: undefined
+      client_name: clientMap[ch.client_id]?.name || null,
+      whatsapp: clientMap[ch.client_id]?.whatsapp || null
     }));
 
     res.json({ due_in_3_days: flatten(dueIn3), overdue: flatten(overdueList) });
@@ -217,19 +218,24 @@ router.get('/charges/:id/whatsapp', authenticate, async (req, res) => {
   try {
     const { data: charge, error } = await supabase
       .from('charges')
-      .select('*, clients(name, whatsapp)')
+      .select('*')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
 
     if (error || !charge) return res.status(404).json({ error: 'Cobranca nao encontrada' });
+
+    // Lookup client separately
+    const { data: clientData } = charge.client_id
+      ? await supabase.from('clients').select('id, name, whatsapp').eq('id', charge.client_id).maybeSingle()
+      : { data: null };
 
     const { data: settingsRows } = await supabase.from('settings').select('key, value');
     const settings = {};
     (settingsRows || []).forEach(s => settings[s.key] = s.value);
 
     const dueDate = new Date(charge.due_date).toLocaleDateString('pt-BR');
-    const clientName = charge.clients?.name || '';
-    const whatsapp = charge.clients?.whatsapp?.replace(/\D/g, '');
+    const clientName = clientData?.name || '';
+    const whatsapp = clientData?.whatsapp?.replace(/\D/g, '');
 
     let msg = (settings.whatsapp_template_charge || 'Ola {nome}! Cobranca de R$ {valor} vence em {vencimento}. PIX: {pix_chave}')
       .replace('{nome}', clientName)

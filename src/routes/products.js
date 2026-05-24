@@ -17,7 +17,6 @@ router.get('/', authenticate, async (req, res) => {
       .order('name');
 
     if (category) query = query.eq('category', category);
-    // low_stock filter: stock_quantity <= min_stock (requires RPC or post-filter)
     const { data, error } = await query;
     if (error) throw error;
 
@@ -71,12 +70,11 @@ router.post('/:id/stock-entry', authenticate, async (req, res) => {
     const { quantity, unit_cost, notes } = req.body;
     if (!quantity || quantity <= 0) return res.status(400).json({ error: 'Quantidade invalida' });
 
-    // Fetch current stock
     const { data: prod, error: fetchErr } = await supabase
       .from('products')
       .select('stock_quantity, cost_price')
       .eq('id', req.params.id)
-      .single();
+      .maybeSingle();
     if (fetchErr) throw fetchErr;
 
     const newQty = (prod.stock_quantity || 0) + Number(quantity);
@@ -129,18 +127,25 @@ router.get('/:id/movements', authenticate, async (req, res) => {
 
 router.get('/kits/:clientId', authenticate, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data: kitRaw, error } = await supabase
       .from('client_kits')
-      .select('*, products(name, unit, sale_price)')
+      .select('*')
       .eq('client_id', req.params.clientId);
 
     if (error) throw error;
-    res.json((data || []).map(k => ({
+
+    // Lookup products separately
+    const productIds = [...new Set((kitRaw || []).map(k => k.product_id).filter(Boolean))];
+    const { data: products } = productIds.length
+      ? await supabase.from('products').select('id, name, unit, sale_price').in('id', productIds)
+      : { data: [] };
+    const productMap = Object.fromEntries((products || []).map(p => [p.id, p]));
+
+    res.json((kitRaw || []).map(k => ({
       ...k,
-      name: k.products?.name,
-      unit: k.products?.unit,
-      sale_price: k.products?.sale_price,
-      products: undefined
+      name: productMap[k.product_id]?.name || null,
+      unit: productMap[k.product_id]?.unit || null,
+      sale_price: productMap[k.product_id]?.sale_price || null
     })));
   } catch (e) { res.status(500).json({ error: errMsg(e) }); }
 });

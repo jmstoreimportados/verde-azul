@@ -6,13 +6,11 @@ const router = express.Router();
 const isProd = process.env.NODE_ENV === 'production';
 const errMsg = (e) => isProd ? 'Erro interno do servidor' : e.message;
 
-// Helper: month start/end as date strings
 function monthRange(year, month) {
   const m = String(month).padStart(2, '0');
   return { gte: `${year}-${m}-01`, lte: `${year}-${m}-31` };
 }
 
-// Helper: sum array of objects by field
 const sum = (arr, field) => (arr || []).reduce((s, r) => s + parseFloat(r[field] || 0), 0);
 
 // Receita por periodo (ultimos 6 meses)
@@ -21,7 +19,6 @@ router.get('/revenue', authenticate, async (req, res) => {
     const { data, error } = await supabase.rpc('get_revenue_by_month');
     if (!error && data) return res.json(data);
 
-    // Fallback: compute month by month
     const months = [];
     for (let i = 5; i >= 0; i--) {
       const d = new Date();
@@ -67,11 +64,9 @@ router.get('/profit', authenticate, async (req, res) => {
       supabase.from('charges').select('value').eq('status', 'paid').eq('type', 'extra').gte('due_date', gte).lte('due_date', lte),
       supabase.from('expenses').select('value').gte('date', gte).lte('date', lte),
       supabase.from('expenses').select('category, value').gte('date', gte).lte('date', lte),
-      // Product cost: sum(quantity * cost_price) for service outflows this month via RPC
       supabase.rpc('get_product_cost_by_month', { month_start: gte, month_end: lte })
     ]);
 
-    // Aggregate expense detail by category
     const catMap = {};
     for (const r of (expenseDetail || [])) {
       catMap[r.category] = (catMap[r.category] || 0) + parseFloat(r.value);
@@ -100,24 +95,31 @@ router.get('/overdue', authenticate, async (req, res) => {
       return res.json({ charges: data, total, count: data.length });
     }
 
-    // Fallback: get overdue and compute days in JS
+    // Fallback: get overdue and compute days in JS, then lookup clients separately
     const { data: overdue, error: err2 } = await supabase
       .from('charges')
-      .select('*, clients(name, whatsapp, phone)')
+      .select('*')
       .eq('status', 'overdue')
       .order('due_date');
 
     if (err2) throw err2;
+
+    const clientIds = [...new Set((overdue || []).map(ch => ch.client_id).filter(Boolean))];
+    const { data: clients } = clientIds.length
+      ? await supabase.from('clients').select('id, name, whatsapp, phone').in('id', clientIds)
+      : { data: [] };
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
+
     const today = new Date();
     const formatted = (overdue || []).map(ch => {
       const due = new Date(ch.due_date);
       const days = Math.floor((today - due) / 86400000);
+      const client = clientMap[ch.client_id] || {};
       return {
         ...ch,
-        client_name: ch.clients?.name,
-        whatsapp: ch.clients?.whatsapp,
-        phone: ch.clients?.phone,
-        clients: undefined,
+        client_name: client.name || null,
+        whatsapp: client.whatsapp || null,
+        phone: client.phone || null,
         days_overdue: days
       };
     }).sort((a, b) => b.days_overdue - a.days_overdue);
@@ -134,7 +136,6 @@ router.get('/top-clients', authenticate, async (req, res) => {
     const { data, error } = await supabase.rpc('get_top_clients', { row_limit: limit });
     if (!error && data) return res.json(data);
 
-    // Fallback: fetch and aggregate in JS
     const { data: clients, error: err2 } = await supabase
       .from('clients')
       .select('id, name, phone, plan_type')
@@ -198,13 +199,13 @@ router.get('/services-performed', authenticate, async (req, res) => {
       { data: byType },
       { count: scheduled },
       { count: cancelled },
-      { data: employeeServices }
+      { data: employeeServicesRaw }
     ] = await Promise.all([
       supabase.from('services').select('*', { count: 'exact', head: true }).eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte),
       supabase.from('services').select('service_category').eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte),
       supabase.from('services').select('*', { count: 'exact', head: true }).gte('scheduled_date', gte).lte('scheduled_date', lte),
       supabase.from('services').select('*', { count: 'exact', head: true }).eq('status', 'cancelled').gte('scheduled_date', gte).lte('scheduled_date', lte),
-      supabase.from('services').select('employee_id, rating, employees(name)').eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte)
+      supabase.from('services').select('employee_id, rating, service_category').eq('status', 'completed').gte('completed_date', gte).lte('completed_date', lte)
     ]);
 
     // Aggregate by type
@@ -214,11 +215,18 @@ router.get('/services-performed', authenticate, async (req, res) => {
     }
     const byTypeResult = Object.entries(typeMap).map(([service_category, count]) => ({ service_category, count }));
 
+    // Lookup employee names separately
+    const empIds = [...new Set((employeeServicesRaw || []).map(s => s.employee_id).filter(Boolean))];
+    const { data: emps } = empIds.length
+      ? await supabase.from('employees').select('id, name').in('id', empIds)
+      : { data: [] };
+    const empNameMap = Object.fromEntries((emps || []).map(e => [e.id, e.name]));
+
     // Aggregate by employee
     const empMap = {};
-    for (const s of (employeeServices || [])) {
+    for (const s of (employeeServicesRaw || [])) {
       const empId = s.employee_id;
-      const empName = s.employees?.name || 'Sem tecnico';
+      const empName = empNameMap[empId] || 'Sem tecnico';
       if (!empMap[empId]) empMap[empId] = { name: empName, count: 0, ratings: [] };
       empMap[empId].count++;
       if (s.rating) empMap[empId].ratings.push(s.rating);
@@ -269,7 +277,6 @@ router.get('/satisfaction', authenticate, async (req, res) => {
       .select('rating')
       .not('rating', 'is', null);
 
-    // Distribution
     const distMap = {};
     for (const r of (allRatings || [])) {
       distMap[r.rating] = (distMap[r.rating] || 0) + 1;
@@ -293,7 +300,6 @@ router.get('/at-risk', authenticate, async (req, res) => {
     const { data, error } = await supabase.rpc('get_at_risk_clients');
     if (!error && data) return res.json(data);
 
-    // Fallback: compute in JS
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - 90);
     const cutoffStr = cutoff.toISOString().split('T')[0];
@@ -430,12 +436,19 @@ router.get('/water-quality-alerts', authenticate, async (req, res) => {
 
     const { data: recent, error } = await supabase
       .from('services')
-      .select('id, water_quality, completed_date, clients(name, whatsapp)')
+      .select('id, water_quality, completed_date, client_id')
       .eq('status', 'completed')
       .neq('water_quality', '{}')
       .gte('completed_date', cutoffStr);
 
     if (error) throw error;
+
+    // Lookup clients separately
+    const clientIds = [...new Set((recent || []).map(s => s.client_id).filter(Boolean))];
+    const { data: clients } = clientIds.length
+      ? await supabase.from('clients').select('id, name, whatsapp').in('id', clientIds)
+      : { data: [] };
+    const clientMap = Object.fromEntries((clients || []).map(c => [c.id, c]));
 
     const alerts = [];
     for (const svc of (recent || [])) {
@@ -450,11 +463,12 @@ router.get('/water-quality-alerts', authenticate, async (req, res) => {
         }
       }
       if (issues.length > 0) {
+        const client = clientMap[svc.client_id] || {};
         alerts.push({
           id: svc.id,
           completed_date: svc.completed_date,
-          client_name: svc.clients?.name,
-          whatsapp: svc.clients?.whatsapp,
+          client_name: client.name || null,
+          whatsapp: client.whatsapp || null,
           issues
         });
       }
@@ -478,10 +492,10 @@ router.get('/product-consumption', authenticate, async (req, res) => {
       return res.json({ items: data, total_cost: totalCost });
     }
 
-    // Fallback: aggregate in JS
+    // Fallback: aggregate in JS — fetch movements then lookup products separately
     const { data: movements, error: err2 } = await supabase
       .from('stock_movements')
-      .select('product_id, quantity, products(name, unit, cost_price)')
+      .select('product_id, quantity')
       .eq('type', 'out')
       .eq('reference_type', 'service')
       .gte('created_at', gte)
@@ -489,14 +503,22 @@ router.get('/product-consumption', authenticate, async (req, res) => {
 
     if (err2) throw err2;
 
+    // Lookup products separately
+    const productIds = [...new Set((movements || []).map(mv => mv.product_id).filter(Boolean))];
+    const { data: products } = productIds.length
+      ? await supabase.from('products').select('id, name, unit, cost_price').in('id', productIds)
+      : { data: [] };
+    const productMap = Object.fromEntries((products || []).map(p => [p.id, p]));
+
     const prodMap = {};
     for (const mv of (movements || [])) {
       const id = mv.product_id;
+      const prod = productMap[id] || {};
       if (!prodMap[id]) {
         prodMap[id] = {
-          name: mv.products?.name,
-          unit: mv.products?.unit,
-          cost_price: parseFloat(mv.products?.cost_price || 0),
+          name: prod.name || null,
+          unit: prod.unit || null,
+          cost_price: parseFloat(prod.cost_price || 0),
           total_used: 0,
           total_cost: 0
         };
@@ -542,20 +564,26 @@ router.get('/client-history/:clientId', authenticate, async (req, res) => {
       .from('clients')
       .select('*')
       .eq('id', req.params.clientId)
-      .single();
+      .maybeSingle();
 
     if (error || !client) return res.status(404).json({ error: 'Cliente nao encontrado' });
     client.service_types = JSON.parse(client.service_types || '[]');
 
-    const [{ data: services }, { data: charges }] = await Promise.all([
-      supabase.from('services').select('*, employees(name)').eq('client_id', client.id).order('scheduled_date', { ascending: false }),
+    const [{ data: servicesRaw }, { data: charges }] = await Promise.all([
+      supabase.from('services').select('*').eq('client_id', client.id).order('scheduled_date', { ascending: false }),
       supabase.from('charges').select('*').eq('client_id', client.id).order('due_date', { ascending: false })
     ]);
 
-    const servicesFormatted = (services || []).map(s => ({
+    // Lookup employee names separately
+    const empIds = [...new Set((servicesRaw || []).map(s => s.employee_id).filter(Boolean))];
+    const { data: emps } = empIds.length
+      ? await supabase.from('employees').select('id, name').in('id', empIds)
+      : { data: [] };
+    const empMap = Object.fromEntries((emps || []).map(e => [e.id, e.name]));
+
+    const servicesFormatted = (servicesRaw || []).map(s => ({
       ...s,
-      employee_name: s.employees?.name,
-      employees: undefined,
+      employee_name: empMap[s.employee_id] || null,
       checklist: JSON.parse(s.checklist || '[]'),
       water_quality: JSON.parse(s.water_quality || '{}'),
       products_used: JSON.parse(s.products_used || '[]'),
