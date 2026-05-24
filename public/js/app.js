@@ -127,7 +127,7 @@ async function login(username, password) {
   errEl.style.display = 'none';
 
   try {
-    const data = await api('POST', '/auth/login', { username, password });
+    const data = await api('POST', '/auth/login', { email: username, password });
     authToken = data.token;
     localStorage.setItem('va_token', authToken);
     currentUser = data.user;
