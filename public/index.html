@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Verde &amp; Azul Gestão</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- LOGIN PAGE -->
+  <div id="login-page" class="login-page">
+    <div class="login-card">
+      <div class="login-logo">
+        <div class="logo-icon">🌿</div>
+        <h1>Verde &amp; Azul Gestão</h1>
+        <p>Sistema de Gestão de Manutenção Residencial</p>
+      </div>
+      <form id="login-form" class="login-form" novalidate>
+        <div class="form-group">
+          <label for="login-username">Usuário</label>
+          <input type="text" id="login-username" name="username" placeholder="Digite seu usuário" autocomplete="username" required />
+        </div>
+        <div class="form-group">
+          <label for="login-password">Senha</label>
+          <input type="password" id="login-password" name="password" placeholder="Digite sua senha" autocomplete="current-password" required />
+        </div>
+        <div id="login-error" class="login-error" style="display:none;"></div>
+        <button type="submit" class="btn btn-primary btn-full" id="login-btn">Entrar</button>
+      </form>
+      <p class="login-footer">Verde &amp; Azul &copy; 2025</p>
+    </div>
+  </div>
+
+  <!-- MAIN APP -->
+  <div id="app" class="app" style="display:none;">
+
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-logo">🌿</span>
+        <span class="sidebar-title">Verde &amp; Azul</span>
+        <button id="sidebar-close" class="sidebar-close" title="Fechar menu">✕</button>
+      </div>
+      <nav class="sidebar-nav">
+        <a href="#" class="nav-item" data-section="dashboard">
+          <span class="nav-icon">📊</span><span class="nav-label">Dashboard</span>
+        </a>
+        <a href="#" class="nav-item" data-section="clients" data-perm="clients">
+          <span class="nav-icon">👥</span><span class="nav-label">Clientes</span>
+        </a>
+        <a href="#" class="nav-item" data-section="agenda" data-perm="agenda">
+          <span class="nav-icon">📅</span><span class="nav-label">Agenda</span>
+        </a>
+        <a href="#" class="nav-item" data-section="financial" data-perm="financial">
+          <span class="nav-icon">💰</span><span class="nav-label">Financeiro</span>
+        </a>
+        <a href="#" class="nav-item" data-section="products" data-perm="products">
+          <span class="nav-icon">📦</span><span class="nav-label">Produtos</span>
+        </a>
+        <a href="#" class="nav-item" data-section="team" data-perm="team">
+          <span class="nav-icon">👷</span><span class="nav-label">Equipe</span>
+        </a>
+        <a href="#" class="nav-item" data-section="budgets" data-perm="budgets">
+          <span class="nav-icon">📋</span><span class="nav-label">Orçamentos</span>
+        </a>
+        <a href="#" class="nav-item" data-section="reports" data-perm="reports">
+          <span class="nav-icon">📈</span><span class="nav-label">Relatórios</span>
+        </a>
+        <a href="#" class="nav-item" data-section="settings" data-perm="settings">
+          <span class="nav-icon">⚙️</span><span class="nav-label">Configurações</span>
+        </a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-info">
+          <span class="user-avatar" id="user-avatar">U</span>
+          <div class="user-details">
+            <span class="user-name" id="user-name">Usuário</span>
+            <span class="user-role" id="user-role">-</span>
+          </div>
+        </div>
+        <button class="btn-logout" id="logout-btn" title="Sair">🚪</button>
+      </div>
+    </aside>
+
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <div class="main-wrapper">
+      <header class="topbar">
+        <button id="menu-toggle" class="menu-toggle" title="Menu">☰</button>
+        <h2 id="page-title" class="page-title">Dashboard</h2>
+        <div class="topbar-right">
+          <span id="topbar-user" class="topbar-user"></span>
+        </div>
+      </header>
+
+      <main class="content">
+        <section id="section-dashboard" class="section active">
+          <div id="dashboard-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-clients" class="section">
+          <div id="clients-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-agenda" class="section">
+          <div id="agenda-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-financial" class="section">
+          <div id="financial-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-products" class="section">
+          <div id="products-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-team" class="section">
+          <div id="team-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-budgets" class="section">
+          <div id="budgets-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-reports" class="section">
+          <div id="reports-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+        <section id="section-settings" class="section">
+          <div id="settings-content"><div class="loading-spinner"><div class="spinner"></div></div></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- MODAL -->
+  <div id="modal-overlay" class="modal-overlay" style="display:none;">
+    <div class="modal" id="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">Título</h3>
+        <button class="modal-close" id="modal-close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- TOAST -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <!-- SCRIPTS -->
+  <script src="js/app.js"></script>
+  <script src="js/modules/dashboard.js"></script>
+  <script src="js/modules/clients.js"></script>
+  <script src="js/modules/agenda.js"></script>
+  <script src="js/modules/financial.js"></script>
+  <script src="js/modules/products.js"></script>
+  <script src="js/modules/team.js"></script>
+  <script src="js/modules/budgets.js"></script>
+  <script src="js/modules/reports.js"></script>
+  <script src="js/modules/settings.js"></script>
+</body>
+</html>
